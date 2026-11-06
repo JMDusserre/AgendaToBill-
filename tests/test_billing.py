@@ -5,8 +5,8 @@ import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-import pdf_generator
-from billing import (
+import agendatobill.pdf_generator as pdf_generator
+from agendatobill.billing import (
     duration_hours,
     event_key,
     event_status,
@@ -118,6 +118,8 @@ class BillingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             previous = os.getcwd()
             os.chdir(tmp)
+            os.environ["AGENDA_DATA_DIR"] = tmp
+            os.environ["AGENDA_INVOICE_DIR"] = os.path.join(tmp, "factures")
             try:
                 with open("students.json", "w", encoding="utf-8") as handle:
                     json.dump({"camille martin": {"tarif": 40, "parent": "", "adresse": ""}}, handle)
@@ -144,6 +146,8 @@ class BillingTests(unittest.TestCase):
                 self.assertIn("CE LOT", recap)
                 self.assertIn("100.00", recap)
             finally:
+                os.environ.pop("AGENDA_DATA_DIR", None)
+                os.environ.pop("AGENDA_INVOICE_DIR", None)
                 os.chdir(previous)
 
 

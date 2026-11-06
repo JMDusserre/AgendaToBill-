@@ -3,7 +3,7 @@ import os
 import tempfile
 from fpdf import FPDF
 
-from billing import (
+from agendatobill.billing import (
     duration_hours,
     event_key,
     invoice_basename,
@@ -12,13 +12,12 @@ from billing import (
     parse_event_line,
     display_name,
 )
-
-INVOICED_PATH = "invoiced.json"
+from agendatobill.paths import data_file, invoice_dir
 
 
 def load_students():
     try:
-        with open("students.json", "r", encoding="utf-8") as handle:
+        with open(data_file("students.json"), "r", encoding="utf-8") as handle:
             return json.load(handle)
     except FileNotFoundError:
         print("Fichier students.json introuvable.")
@@ -30,7 +29,7 @@ def load_students():
 
 def load_invoiced():
     try:
-        with open(INVOICED_PATH, "r", encoding="utf-8") as handle:
+        with open(data_file("invoiced.json"), "r", encoding="utf-8") as handle:
             data = json.load(handle)
         if isinstance(data, list):
             return set(data)
@@ -40,6 +39,7 @@ def load_invoiced():
 
 
 def atomic_write(path, content):
+    path = os.fspath(path)
     directory = os.path.dirname(os.path.abspath(path)) or "."
     handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, delete=False)
     try:
@@ -54,7 +54,7 @@ def atomic_write(path, content):
 
 
 def save_invoiced(keys):
-    atomic_write(INVOICED_PATH, json.dumps(sorted(keys), indent=2, ensure_ascii=False))
+    atomic_write(data_file("invoiced.json"), json.dumps(sorted(keys), indent=2, ensure_ascii=False))
 
 
 def pdf_text(value):
@@ -62,14 +62,15 @@ def pdf_text(value):
 
 
 def unique_invoice_path(basename):
-    os.makedirs("factures", exist_ok=True)
-    path = os.path.join("factures", basename)
+    folder = invoice_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / basename
     if not os.path.exists(path):
         return path
     stem, ext = os.path.splitext(basename)
     index = 2
     while True:
-        candidate = os.path.join("factures", f"{stem}_{index}{ext}")
+        candidate = invoice_dir() / f"{stem}_{index}{ext}"
         if not os.path.exists(candidate):
             return candidate
         index += 1
@@ -122,7 +123,7 @@ def generate_pdf_invoice(student_name, date_str, duration, montant, parent="", a
         filename = f"Facture_{safe_name}_{safe_date}.pdf"
 
     path = unique_invoice_path(filename)
-    pdf.output(path)
+    pdf.output(str(path))
     return path
 
 
@@ -131,7 +132,7 @@ def process_events():
     result = {"created": 0, "skipped": 0, "warnings": [], "files": []}
 
     try:
-        with open("raw_events.txt", "r", encoding="utf-8") as handle:
+        with open(data_file("raw_events.txt"), "r", encoding="utf-8") as handle:
             lines = handle.read().strip().split("\n")
     except FileNotFoundError:
         result["warnings"].append("Fichier raw_events.txt introuvable.")
@@ -200,8 +201,8 @@ def process_events():
             result["warnings"].append(f"Ligne {line_number} ignorée : {exc}")
 
     if result["created"] > 0:
-        os.makedirs("factures", exist_ok=True)
-        recap_path = "factures/recapitulatif_urssaf.txt"
+        invoice_dir().mkdir(parents=True, exist_ok=True)
+        recap_path = invoice_dir() / "recapitulatif_urssaf.txt"
         with open(recap_path, "w", encoding="utf-8") as handle:
             handle.write("=== RECAPITULATIF DU LOT FACTURE ===\n\n")
             handle.write(f"TOTAL FACTURE SUR CE LOT : {total_global:.2f} EUR\n")

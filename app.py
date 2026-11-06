@@ -8,10 +8,10 @@ from urllib.parse import urlparse
 
 import caldav
 from dotenv import load_dotenv
-from flask import Flask, abort, flash, redirect, render_template_string, request, send_file, send_from_directory, session
+from flask import Flask, abort, flash, redirect, render_template_string, request, send_file, send_from_directory, session, url_for
 
-import pdf_generator
-from billing import (
+import agendatobill.pdf_generator as pdf_generator
+from agendatobill.billing import (
     PARIS,
     as_utc,
     duration_hours,
@@ -24,8 +24,9 @@ from billing import (
     parse_event_line,
     should_keep_previous_events,
 )
+from agendatobill.paths import data_file, env_file, invoice_dir
 
-load_dotenv(override=True)
+load_dotenv(env_file(), override=True)
 
 app = Flask(__name__)
 app.config.update(
@@ -77,6 +78,7 @@ HTML_TEMPLATE = """
         
         .nav-bar { position: fixed; bottom: 0; left: 0; right: 0; background: rgba(255,255,255,0.9); backdrop-filter: blur(10px); border-top: 1px solid #c7c7cc; display: flex; justify-content: space-around; padding: 10px 0 25px 0; z-index: 1000;}
         .nav-item { text-decoration: none; color: #8e8e93; font-size: 12px; text-align: center; font-weight: 500; display: flex; flex-direction: column; align-items: center; width: 33%; }
+        .logout-btn { position: absolute; top: 4px; right: 12px; background: none; border: none; color: #8e8e93; font-size: 11px; cursor: pointer; padding: 0; }
         .nav-item.active { color: #007AFF; }
         .nav-icon { font-size: 24px; margin-bottom: 4px; }
         
@@ -84,6 +86,9 @@ HTML_TEMPLATE = """
         .archive-list li { padding: 12px 0; border-bottom: 1px solid #e5e5ea; display: flex; justify-content: space-between; align-items: center; }
         .archive-list li:last-child { border-bottom: none; }
         .archive-list a { text-decoration: none; color: #007AFF; font-weight: 500; font-size: 15px; display: flex; align-items: center; flex: 1; word-break: break-all; margin-right: 10px; }
+        details { margin-top: 6px; }
+        summary { cursor: pointer; padding: 8px 0; font-weight: 700; color: #0056b3; outline: none; }
+        summary:focus { outline: none; }
         .section-title { font-size: 13px; font-weight: 600; color: #8e8e93; margin-top: 15px; border-top: 1px solid #e5e5ea; padding-top: 10px; text-transform: uppercase; }
         
         .calendar-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
@@ -131,6 +136,9 @@ HTML_TEMPLATE = """
         <h2>🎸 Facturation</h2>
         {% if preview_data %}
             <div class="card">
+                <p style="font-size: 13px; color: #8e8e93; margin-top: 0; margin-bottom: 15px;">
+                        Voici la liste des cours passés qui sont en attente d'être facturés.
+                </p>
                 <table>
                     <tr><th>Élève</th><th>Date</th><th>Durée</th><th>€</th></tr>
                     {% for row in preview_data %}
@@ -149,7 +157,9 @@ HTML_TEMPLATE = """
                 <button type="submit" class="btn">1. Générer les factures</button>
             </form>
         {% else %}
-            <div class="card">Aucun événement terminé en attente.</div>
+            <div class="card" style="text-align: center; color: #8e8e93; font-size: 14px;">
+                Aucun cours n'est actuellement en attente de facturation.
+            </div>
         {% endif %}
         
         <div class="card">
@@ -164,18 +174,30 @@ HTML_TEMPLATE = """
             </form>
 
             {% if archives %}
-                <ul class="archive-list">
-                {% for file in archives %}
-                    <li>
-                        <a href="/view/{{ file }}" target="_blank">📄 {{ file }}</a>
-                        <form action="/delete_file" method="POST" style="margin:0;" onsubmit="return confirm('Supprimer ce fichier définitivement ?');">
-                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                            <input type="hidden" name="filename" value="{{ file }}">
-                            <button type="submit" class="delete-icon" title="Supprimer">🗑️</button>
-                        </form>
-                    </li>
+                {% for group in archives %}
+                <details {% if loop.first %}open{% endif %}>
+                    <summary>{{ group.month }}</summary>
+                    <ul class="archive-list">
+                    {% for item in group.files %}
+                        <li>
+                            <a href="/view/{{ item.filename }}" target="_blank" style="display: flex; align-items: center; text-decoration: none;">
+                                {% if item.student %}
+                                    <span style="background: #eef7ff; color: #0056b3; padding: 4px 8px; border-radius: 6px; font-size: 11px; margin-right: 10px; font-weight: 600; border: 1px solid #b6d4fe; white-space: nowrap;">
+                                        🎓 {{ item.student }}
+                                    </span>
+                                {% endif %}
+                                <span style="font-size: 14px; color: #007AFF; word-break: break-all;">📄 {{ item.filename }}</span>
+                            </a>
+                            <form action="/delete_file" method="POST" style="margin:0;" onsubmit="return confirm('Supprimer ce fichier définitivement ?');">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                                <input type="hidden" name="filename" value="{{ item.filename }}">
+                                <button type="submit" class="delete-icon" title="Supprimer">🗑️</button>
+                            </form>
+                        </li>
+                    {% endfor %}
+                    </ul>
+                </details>
                 {% endfor %}
-                </ul>
                 <form action="/download_zip" method="POST" style="margin-top: 20px;">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <button type="submit" class="btn btn-success">2. Télécharger l'archive ZIP</button>
@@ -347,6 +369,10 @@ HTML_TEMPLATE = """
     {% endif %}
 
     <div class="nav-bar">
+        <form action="/logout" method="POST" style="margin:0;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="logout-btn">Déconnexion</button>
+        </form>
         <a href="/" class="nav-item {% if page == 'factures' %}active{% endif %}">
             <span class="nav-icon">🧾</span><span>Factures</span>
         </a>
@@ -356,6 +382,39 @@ HTML_TEMPLATE = """
         <a href="/clients" class="nav-item {% if page == 'clients' %}active{% endif %}">
             <span class="nav-icon">👥</span><span>Clients</span>
         </a>
+    </div>
+</body>
+</html>
+"""
+
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+    <title>Connexion</title>
+    <style>
+        body { font-family: -apple-system, system-ui, sans-serif; background: #f2f2f7; color: #1c1c1e; padding: 24px; }
+        .card { background: white; border-radius: 12px; padding: 16px; max-width: 420px; margin: 48px auto; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        h2 { margin-top: 0; }
+        input { width: 100%; padding: 12px; margin-bottom: 10px; font-size: 16px; box-sizing: border-box; border-radius: 8px; border: 1px solid #c7c7cc; }
+        button { width: 100%; margin-top: 12px; padding: 16px; background: #007AFF; color: white; border: none; border-radius: 12px; font-size: 17px; font-weight: 600; cursor: pointer; }
+        .warning { background: #fff3cd; color: #856404; padding: 12px; border-radius: 12px; margin-bottom: 12px; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>App Guitare</h2>
+        {% with messages = get_flashed_messages() %}
+            {% for message in messages %}<div class="warning">{{ message }}</div>{% endfor %}
+        {% endwith %}
+        <form method="POST">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="text" name="username" placeholder="Nom" autocomplete="username" autofocus>
+            <input type="password" name="password" placeholder="Mot de passe" autocomplete="current-password">
+            <button type="submit">Entrer</button>
+        </form>
     </div>
 </body>
 </html>
@@ -381,13 +440,36 @@ def inject_csrf():
     return {"csrf_token": csrf_token()}
 
 
+def app_credentials():
+    load_dotenv(env_file(), override=True)
+    username = (os.environ.get("APP_USERNAME") or "Simon Granger").strip()
+    password = (os.environ.get("APP_PASSWORD") or "").strip()
+    return username, password
+
+
+def same_text(given, expected, ignore_case=False):
+    given = (given or "").strip()
+    expected = (expected or "").strip()
+    if ignore_case:
+        given = given.casefold()
+        expected = expected.casefold()
+    if not expected or len(given) != len(expected):
+        return False
+    return secrets.compare_digest(given, expected)
+
+
 @app.before_request
-def check_csrf():
+def require_login():
     if request.method == "POST":
         validate_csrf()
+    if request.endpoint in {"login", "static"}:
+        return
+    if not session.get("logged_in"):
+        return redirect(url_for("login"))
 
 
 def atomic_write(path, content):
+    path = os.fspath(path)
     directory = os.path.dirname(os.path.abspath(path)) or "."
     handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, delete=False)
     try:
@@ -414,7 +496,7 @@ def redirect_back(fallback):
 
 
 def icloud_credentials():
-    load_dotenv(override=True)
+    load_dotenv(env_file(), override=True)
     email = (os.environ.get("ICLOUD_EMAIL") or "").strip()
     password = (os.environ.get("ICLOUD_PASSWORD") or "").strip()
     return email, password
@@ -509,12 +591,12 @@ def fetch_icloud_events():
 
         if seen_calendars and failed_calendars == seen_calendars:
             return "Aucun calendrier n'a pu être lu. Les fichiers locaux n'ont pas été modifiés."
-        previous_raw = read_text("raw_events.txt")
+        previous_raw = read_text(data_file("raw_events.txt"))
         if should_keep_previous_events(len(agenda_events), previous_raw):
             return "La synchro n'a renvoyé aucun cours. Les cours déjà enregistrés ont été conservés."
 
-        atomic_write("raw_events.txt", "\n".join(raw_lines))
-        atomic_write("agenda.json", json.dumps(agenda_events, ensure_ascii=False, indent=4))
+        atomic_write(data_file("raw_events.txt"), "\n".join(raw_lines))
+        atomic_write(data_file("agenda.json"), json.dumps(agenda_events, ensure_ascii=False, indent=4))
         notes = []
         if failed_calendars:
             notes.append(f"{failed_calendars} calendrier(s) illisible(s) ignoré(s).")
@@ -527,7 +609,7 @@ def fetch_icloud_events():
 
 def load_students():
     try:
-        with open("students.json", "r", encoding="utf-8") as handle:
+        with open(data_file("students.json"), "r", encoding="utf-8") as handle:
             data = json.load(handle)
         return data if isinstance(data, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
@@ -536,7 +618,7 @@ def load_students():
 
 def load_agenda():
     try:
-        with open("agenda.json", "r", encoding="utf-8") as handle:
+        with open(data_file("agenda.json"), "r", encoding="utf-8") as handle:
             data = json.load(handle)
         return data if isinstance(data, list) else []
     except (FileNotFoundError, json.JSONDecodeError):
@@ -544,7 +626,7 @@ def load_agenda():
 
 
 def save_students(data):
-    atomic_write("students.json", json.dumps(data, indent=4, ensure_ascii=False))
+    atomic_write(data_file("students.json"), json.dumps(data, indent=4, ensure_ascii=False))
 
 
 def unique_notes(notes):
@@ -564,7 +646,7 @@ def get_preview_data():
     warnings = []
     total_global = 0.0
     try:
-        with open("raw_events.txt", "r", encoding="utf-8") as handle:
+        with open(data_file("raw_events.txt"), "r", encoding="utf-8") as handle:
             lines = handle.read().strip().split("\n")
     except FileNotFoundError:
         return [], "0.00", ["Aucun cours synchronisé."]
@@ -603,16 +685,77 @@ def get_preview_data():
     return preview_data, f"{total_global:.2f}", unique_notes(warnings)
 
 
-def list_archives(search_query=""):
-    if not os.path.isdir("factures"):
+FRENCH_MONTHS = [
+    "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
+    "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre",
+]
+
+
+def month_label(timestamp):
+    moment = datetime.fromtimestamp(timestamp, PARIS)
+    return f"{FRENCH_MONTHS[moment.month - 1]} {moment.year}"
+
+
+def list_archives_with_info(search_query=""):
+    folder = invoice_dir()
+    if not folder.is_dir():
         return []
-    all_files = sorted(
-        [name for name in os.listdir("factures") if name.endswith(".pdf") or name.endswith(".txt")],
-        reverse=True,
-    )
+
+    all_files = [name for name in os.listdir(folder) if name.endswith(".pdf") or name.endswith(".txt")]
+    all_files.sort(key=lambda name: os.path.getmtime(folder / name), reverse=True)
+
     if search_query:
-        return [name for name in all_files if search_query in name.lower()]
-    return all_files
+        all_files = [name for name in all_files if search_query in name.lower()]
+
+    students = load_students()
+    groups = []
+    by_month = {}
+
+    for filename in all_files:
+        modified = os.path.getmtime(folder / filename)
+        label = month_label(modified)
+        if label not in by_month:
+            group = {"month": label, "files": []}
+            by_month[label] = group
+            groups.append(group)
+
+        student_display = ""
+        if filename.endswith(".txt"):
+            student_display = "URSSAF"
+        else:
+            for nom, data in students.items():
+                parent = data.get("parent", "").strip()
+                student_name = nom.title()
+                client_name = parent if parent else student_name
+                if file_matches_person(filename, client_name):
+                    student_display = student_name
+                    break
+
+        by_month[label]["files"].append({
+            "filename": filename,
+            "student": student_display,
+        })
+
+    return groups
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        expected_username, expected_password = app_credentials()
+        username_ok = same_text(request.form.get("username", ""), expected_username, ignore_case=True)
+        password_ok = same_text(request.form.get("password", ""), expected_password)
+        if username_ok and password_ok:
+            session["logged_in"] = True
+            session["username"] = expected_username
+            return redirect("/")
+        flash("Nom ou mot de passe incorrect.")
+    return render_template_string(LOGIN_TEMPLATE)
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 @app.route("/", methods=["GET"])
@@ -630,7 +773,7 @@ def index():
         page="factures",
         preview_data=preview_data,
         total=total,
-        archives=list_archives(search_query),
+        archives=list_archives_with_info(search_query),
         search_query=search_query,
         notices=unique_notes(notices),
         agenda_events=[],
@@ -661,8 +804,9 @@ def agenda():
 def clients():
     students = load_students()
     client_invoices = {nom: [] for nom in students}
-    if os.path.isdir("factures"):
-        all_files = sorted([name for name in os.listdir("factures") if name.endswith(".pdf")], reverse=True)
+    folder = invoice_dir()
+    if folder.is_dir():
+        all_files = sorted([name for name in os.listdir(folder) if name.endswith(".pdf")], reverse=True)
         for nom, data in students.items():
             parent = data.get("parent", "")
             client_invoices[nom] = [
@@ -737,7 +881,7 @@ def delete_client():
 def delete_file():
     filename = request.form.get("filename")
     if safe_filename(filename):
-        filepath = os.path.join("factures", filename)
+        filepath = invoice_dir() / filename
         if os.path.isfile(filepath):
             os.remove(filepath)
             flash("Fichier supprimé.", "success")
@@ -760,11 +904,13 @@ def generate():
 
 @app.route("/download_zip", methods=["POST"])
 def download_zip():
-    if not os.path.isdir("factures"):
+    folder = invoice_dir()
+    if not folder.is_dir():
         flash("Aucun document à archiver.", "warning")
         return redirect("/")
-    shutil.make_archive("factures_export", "zip", "factures")
-    return send_file("factures_export.zip", as_attachment=True)
+    archive = data_file("factures_export")
+    shutil.make_archive(str(archive), "zip", folder)
+    return send_file(str(archive) + ".zip", as_attachment=True)
 
 
 @app.route("/view/<filename>")
@@ -772,7 +918,7 @@ def view_file(filename):
     if not safe_filename(filename):
         abort(404)
     mimetype = "application/pdf" if filename.endswith(".pdf") else "text/plain"
-    return send_from_directory("factures", filename, as_attachment=False, mimetype=mimetype)
+    return send_from_directory(invoice_dir(), filename, as_attachment=False, mimetype=mimetype)
 
 
 if __name__ == "__main__":
