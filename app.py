@@ -5,11 +5,15 @@ from datetime import datetime, timezone
 import shutil
 import caldav
 import pdf_generator
+from dotenv import load_dotenv
 
 app = Flask(__name__)
 
-USERNAME = "jean-michel.dusserre@hotmail.fr"
-PASSWORD = "REMOVED"
+
+load_dotenv()
+
+USERNAME = os.environ.get("ICLOUD_EMAIL")
+PASSWORD = os.environ.get("ICLOUD_PASSWORD")
 CALDAV_URL = "https://caldav.icloud.com/"
 
 HTML_TEMPLATE = """
