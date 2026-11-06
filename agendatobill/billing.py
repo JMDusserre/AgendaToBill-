@@ -50,6 +50,13 @@ def paris_date(dt):
     return as_utc(dt).astimezone(PARIS).strftime("%d/%m/%Y")
 
 
+def starts_before_day(start, day):
+    """Vrai si le cours commence un jour de Paris strictement avant `day`."""
+    if day is None:
+        return False
+    return as_utc(start).astimezone(PARIS).date() < day
+
+
 def expand_occurrences(start, end, rrule_text=None, exdates=None, window_start=None, window_end=None):
     """Déplie une récurrence dans la fenêtre demandée. Sans règle, rend le créneau s'il la croise."""
     start = ensure_aware(start)

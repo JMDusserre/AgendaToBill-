@@ -1,9 +1,13 @@
 import os
+import re
+import zlib
 from datetime import datetime, timezone
 
 from fpdf import FPDF
+from sqlalchemy import func, text
 
 from agendatobill.billing import (
+    PARIS,
     display_name,
     duration_hours,
     event_key,
@@ -23,10 +27,115 @@ from agendatobill.models import (
 )
 
 RECAP_FILENAME = "recapitulatif_urssaf.txt"
+FRENCH_MONTHS = [
+    "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
+    "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre",
+]
+_AMOUNT_IN_PDF = re.compile(r"Montant total .{0,30}?([0-9]+\.[0-9]{2}) EUR")
+_COURSE_STAMP = re.compile(r"(\d{2})-(\d{2})-(\d{4})(?:_(\d{4}))?")
+_NUMBER_SUFFIX = re.compile(r"_n\d+(?=\.pdf$)", re.IGNORECASE)
+_INVOICE_LABEL = re.compile("Facture n° \\d+".encode("latin-1"))
+
+
+def pdf_plain_text(content):
+    raw = bytes(content or b"")
+    chunks = [raw]
+    for match in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", raw, re.S):
+        data = match.group(1)
+        try:
+            chunks.append(zlib.decompress(data))
+        except zlib.error:
+            chunks.append(data)
+    return b"\n".join(chunks).decode("latin-1", "replace")
+
+
+def course_moment(filename, created_at=None):
+    """Date du cours imprimée dans le nom du fichier, sinon la date d'enregistrement."""
+    match = _COURSE_STAMP.search(filename or "")
+    if match:
+        day, month, year, hm = match.groups()
+        hour = int(hm[:2]) if hm else 0
+        minute = int(hm[2:]) if hm else 0
+        try:
+            return datetime(int(year), int(month), int(day), hour, minute, tzinfo=PARIS)
+        except ValueError:
+            pass
+    if created_at is None:
+        return None
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return created_at.astimezone(PARIS)
+
+
+def filename_with_number(filename, number):
+    if _NUMBER_SUFFIX.search(filename or ""):
+        return _NUMBER_SUFFIX.sub(f"_n{number}", filename, count=1)
+    stem, ext = os.path.splitext(filename)
+    return f"{stem}_n{number}{ext}"
+
+
+def replace_invoice_label(content, number):
+    """Met à jour « Facture n° … » sans changer la longueur du flux PDF."""
+    label = f"Facture n° {number}".encode("latin-1")
+    raw = bytes(content or b"")
+
+    def rewrite(data):
+        match = _INVOICE_LABEL.search(data)
+        if not match or len(label) != len(match.group(0)):
+            return data
+        return data[:match.start()] + label + data[match.end():]
+
+    changed = False
+
+    def replace_stream(match):
+        nonlocal changed
+        data = match.group(1)
+        prefix = match.group(0)[:match.start(1) - match.start()]
+        suffix = match.group(0)[match.end(1) - match.start():]
+        try:
+            plain = zlib.decompress(data)
+        except zlib.error:
+            plain = data
+            updated = rewrite(plain)
+            if updated != plain:
+                changed = True
+                return prefix + updated + suffix
+            return match.group(0)
+        updated = rewrite(plain)
+        if updated == plain:
+            return match.group(0)
+        changed = True
+        return prefix + zlib.compress(updated) + suffix
+
+    new_raw = re.sub(rb"stream\r?\n(.*?)\r?\nendstream", replace_stream, raw, flags=re.S)
+    return new_raw if changed else raw
+
+
+def amount_in_pdf_bytes(content):
+    match = _AMOUNT_IN_PDF.search(pdf_plain_text(content))
+    if not match:
+        return None
+    return float(match.group(1))
 
 
 def pdf_text(value):
     return (value or "").encode("latin-1", "replace").decode("latin-1")
+
+
+def starting_invoice_number():
+    raw = (os.environ.get("STARTING_INVOICE_NUMBER") or "1").strip()
+    try:
+        number = int(raw)
+    except ValueError:
+        number = 1
+    return number if number > 0 else 1
+
+
+def next_invoice_number():
+    current = db.session.query(func.max(InvoiceDocument.invoice_number)).scalar()
+    if current is None:
+        return starting_invoice_number()
+    return int(current) + 1
 
 
 def unique_invoice_filename(basename):
@@ -39,13 +148,17 @@ def unique_invoice_filename(basename):
     return f"{stem}_{index}{ext}"
 
 
-def generate_pdf_invoice(student_name, date_str, duration, montant, parent="", adresse="", start=None, end=None):
+def generate_pdf_invoice(student_name, date_str, duration, montant, parent="", adresse="", start=None, end=None, event_key=None):
+    number = next_invoice_number()
     pdf = FPDF()
     pdf.add_page()
 
     pdf.set_font("Helvetica", style="B", size=16)
     pdf.cell(200, 10, txt="FACTURE / RECU DE COURS", ln=True, align="C")
-    pdf.ln(10)
+    pdf.ln(4)
+    pdf.set_font("Helvetica", style="B", size=12)
+    pdf.cell(200, 8, txt=pdf_text(f"Facture n° {number}"), ln=True, align="C")
+    pdf.ln(6)
 
     pdf.set_font("Helvetica", size=11)
     pdf.cell(200, 6, txt=pdf_text("Prestataire : Jean-Michel Dusserre"), ln=True)
@@ -85,26 +198,118 @@ def generate_pdf_invoice(student_name, date_str, duration, montant, parent="", a
         safe_date = date_str.replace("/", "-")
         filename = f"Facture_{safe_name}_{safe_date}.pdf"
 
-    filename = unique_invoice_filename(filename)
+    stem, ext = os.path.splitext(filename)
+    filename = unique_invoice_filename(f"{stem}_n{number}{ext}")
     payload = bytes(pdf.output())
     db.session.add(InvoiceDocument(
         filename=filename,
         content=payload,
         created_at=datetime.now(timezone.utc),
+        invoice_number=number,
+        montant=float(montant),
+        event_key=event_key,
     ))
     return filename
 
 
 def store_recap(text):
     payload = text.encode("utf-8")
-    now = datetime.now(timezone.utc)
     row = db.session.get(InvoiceDocument, RECAP_FILENAME)
     if row is None:
-        db.session.add(InvoiceDocument(filename=RECAP_FILENAME, content=payload, created_at=now))
-    else:
-        row.content = payload
-        row.created_at = now
+        db.session.add(InvoiceDocument(
+            filename=RECAP_FILENAME,
+            content=payload,
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.session.commit()
+        return
+    if bytes(row.content or b"") == payload:
+        return
+    row.content = payload
     db.session.commit()
+
+
+def invoice_amount(row):
+    if row.montant is not None:
+        return float(row.montant)
+    amount = amount_in_pdf_bytes(row.content)
+    if amount is None:
+        return None
+    row.montant = amount
+    return amount
+
+
+def refresh_urssaf_recap():
+    """Réécrit le récapitulatif avec le total facturé de chaque mois."""
+    rows = InvoiceDocument.query.filter(InvoiceDocument.filename.endswith(".pdf")).all()
+    totals = {}
+    for row in rows:
+        amount = invoice_amount(row)
+        moment = course_moment(row.filename, row.created_at)
+        if amount is None or moment is None:
+            continue
+        key = (moment.year, moment.month)
+        totals[key] = totals.get(key, 0.0) + amount
+
+    lines = [
+        "=== RECAPITULATIF URSSAF ===\n\n",
+        "Somme des factures générées, pour la déclaration.\n\n",
+    ]
+    grand = 0.0
+    for year, month in sorted(totals, reverse=True):
+        amount = totals[(year, month)]
+        grand += amount
+        lines.append(f"- {FRENCH_MONTHS[month - 1]} {year} : {amount:.2f} EUR\n")
+    if not totals:
+        lines.append("Aucune facture générée.\n")
+    lines.append(f"\nTOTAL FACTURE : {grand:.2f} EUR\n")
+    store_recap("".join(lines))
+
+
+def assign_invoice_numbers():
+    """Numérote les factures sans numéro, dans l'ordre de la date du cours."""
+    rows = InvoiceDocument.query.filter(InvoiceDocument.filename.endswith(".pdf")).all()
+    rows.sort(key=lambda row: (
+        course_moment(row.filename, row.created_at) or datetime.min.replace(tzinfo=timezone.utc),
+        row.filename,
+    ))
+    start = starting_invoice_number()
+    plan = []
+    already_ok = True
+    for index, row in enumerate(rows):
+        number = start + index
+        new_name = filename_with_number(row.filename, number)
+        if row.invoice_number != number or row.filename != new_name:
+            already_ok = False
+        plan.append({
+            "old": row.filename,
+            "new": new_name,
+            "number": number,
+            "content": replace_invoice_label(bytes(row.content or b""), number),
+        })
+    if already_ok or not plan:
+        return
+    for index, item in enumerate(plan):
+        db.session.execute(
+            text("UPDATE invoice_document SET invoice_number = NULL, filename = :tmp WHERE filename = :old"),
+            {"tmp": f"__tmp_{index}.pdf", "old": item["old"]},
+        )
+    db.session.flush()
+    for index, item in enumerate(plan):
+        db.session.execute(
+            text(
+                "UPDATE invoice_document SET filename = :name, invoice_number = :number, content = :content "
+                "WHERE filename = :tmp"
+            ),
+            {
+                "name": item["new"],
+                "number": item["number"],
+                "content": item["content"],
+                "tmp": f"__tmp_{index}.pdf",
+            },
+        )
+    db.session.commit()
+    db.session.expire_all()
 
 
 def process_events():
@@ -118,8 +323,6 @@ def process_events():
 
     lines = raw_events.strip().split("\n")
     invoiced = invoiced_keys()
-    recap = {}
-    total_global = 0.0
 
     for line_number, line in enumerate(lines, 1):
         if not line.strip():
@@ -154,7 +357,6 @@ def process_events():
             adresse = student_data.get("adresse", "")
             montant = duration * rate
             student_label = display_name(student_key)
-            facture_a = parent if parent else student_label
             formatted_date = paris_date(start)
 
             filename = generate_pdf_invoice(
@@ -166,15 +368,12 @@ def process_events():
                 adresse,
                 start,
                 end,
+                key,
             )
             db.session.add(InvoicedEvent(event_key=key))
             db.session.commit()
             invoiced.add(key)
 
-            recap.setdefault(facture_a, {"heures": 0.0, "montant": 0.0})
-            recap[facture_a]["heures"] += duration
-            recap[facture_a]["montant"] += montant
-            total_global += montant
             result["created"] += 1
             result["files"].append(filename)
         except Exception as exc:
@@ -182,15 +381,7 @@ def process_events():
             result["warnings"].append(f"Ligne {line_number} ignorée : {exc}")
 
     if result["created"] > 0:
-        lines_out = [
-            "=== RECAPITULATIF DU LOT FACTURE ===\n",
-            f"TOTAL FACTURE SUR CE LOT : {total_global:.2f} EUR\n",
-            "Ce montant correspond aux factures créées lors de cette génération, pas aux encaissements.\n",
-            "\nDetail par client :\n",
-        ]
-        for client, data in recap.items():
-            lines_out.append(f"- {client} : {data['heures']:.2f}h -> {data['montant']:.2f} EUR\n")
-        store_recap("".join(lines_out))
+        refresh_urssaf_recap()
 
     print(f"Termine. {result['created']} facture(s), {result['skipped']} deja facturee(s).")
     return result

@@ -17,3 +17,7 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      - key: STARTING_INVOICE_NUMBER
+        value: "1"
+      - key: SYNC_START_DATE
+        sync: false

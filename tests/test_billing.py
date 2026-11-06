@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+import zlib
 from datetime import datetime, timezone
 from unittest import mock
 
@@ -17,6 +18,7 @@ from agendatobill.billing import (
     paris_date,
     parse_event_line,
     should_keep_previous_events,
+    starts_before_day,
 )
 
 
@@ -113,13 +115,26 @@ class BillingTests(unittest.TestCase):
         self.assertFalse(should_keep_previous_events(2, "un cours\n"))
         self.assertFalse(should_keep_previous_events(0, ""))
 
+    def test_sync_ignores_days_before_the_start_date(self):
+        limit = datetime(2026, 11, 1).date()
+        october = datetime.fromisoformat("2026-10-31T23:30:00+01:00")
+        november = datetime.fromisoformat("2026-11-01T00:30:00+01:00")
+        self.assertTrue(starts_before_day(october, limit))
+        self.assertFalse(starts_before_day(november, limit))
+        self.assertFalse(starts_before_day(october, None))
+
+    def test_amount_is_read_from_a_compressed_pdf(self):
+        stream = zlib.compress("Montant total à régler : 22.50 EUR".encode("latin-1"))
+        pdf = b"stream\n" + stream + b"\nendstream"
+        self.assertEqual(pdf_generator.amount_in_pdf_bytes(pdf), 22.5)
+
     def test_process_events_does_not_invent_a_rate_or_rebill(self):
         db_file = tempfile.NamedTemporaryFile(prefix="agendatobill-", suffix=".sqlite", delete=False)
         db_file.close()
         os.environ["AGENDA_DATABASE_URL"] = "sqlite:///" + db_file.name
         try:
             import app as webapp
-            from agendatobill.models import InvoiceDocument, Student, SyncCache, db
+            from agendatobill.models import InvoiceDocument, InvoicedEvent, Student, SyncCache, db
 
             events = "\n".join([
                 "2026-11-04T17:00:00+01:00|2026-11-04T18:00:00+01:00|Cours Camille Martin",
@@ -143,11 +158,15 @@ class BillingTests(unittest.TestCase):
                 self.assertEqual(second["skipped"], 2)
                 pdfs = InvoiceDocument.query.filter(InvoiceDocument.filename.endswith(".pdf")).all()
                 self.assertEqual(len(pdfs), 2)
+                self.assertEqual(sorted(row.invoice_number for row in pdfs), [1, 2])
                 self.assertTrue(all(bytes(row.content).startswith(b"%PDF") for row in pdfs))
+                self.assertTrue(any("_n1.pdf" in row.filename for row in pdfs))
+                self.assertAlmostEqual(sum(row.montant for row in pdfs), 100.0)
                 recap = db.session.get(InvoiceDocument, "recapitulatif_urssaf.txt")
                 text = bytes(recap.content).decode("utf-8")
-                self.assertIn("CE LOT", text)
+                self.assertIn("Novembre 2026", text)
                 self.assertIn("100.00", text)
+                self.assertIn("TOTAL FACTURE", text)
 
                 client = webapp.app.test_client()
                 with client.session_transaction() as sess:
@@ -160,12 +179,40 @@ class BillingTests(unittest.TestCase):
                 archived = client.post("/download_zip", data={"csrf_token": "token-test"})
                 self.assertEqual(archived.status_code, 200)
                 self.assertTrue(archived.data.startswith(b"PK"))
+                latest = max(pdfs, key=lambda row: row.invoice_number)
+                removed_key = latest.event_key
                 removed = client.post("/delete_file", data={
                     "csrf_token": "token-test",
-                    "filename": pdfs[0].filename,
+                    "filename": latest.filename,
                 })
                 self.assertEqual(removed.status_code, 302)
-                self.assertIsNone(db.session.get(InvoiceDocument, pdfs[0].filename))
+                self.assertIsNone(db.session.get(InvoiceDocument, latest.filename))
+                self.assertIsNone(db.session.get(InvoicedEvent, removed_key))
+
+                with mock.patch("builtins.print"):
+                    third = pdf_generator.process_events()
+                self.assertEqual(third["created"], 1)
+                self.assertEqual(third["skipped"], 1)
+                pdfs = InvoiceDocument.query.filter(InvoiceDocument.filename.endswith(".pdf")).all()
+                self.assertEqual(sorted(row.invoice_number for row in pdfs), [1, 2])
+
+                db.session.add(InvoiceDocument(
+                    filename="Facture_Camille_Martin_01-11-2026.pdf",
+                    content=b"%PDF-1.3",
+                    created_at=datetime(2026, 11, 1, tzinfo=timezone.utc),
+                    montant=10,
+                ))
+                db.session.commit()
+                pdf_generator.assign_invoice_numbers()
+                numbered = (
+                    InvoiceDocument.query
+                    .filter(InvoiceDocument.filename.endswith(".pdf"))
+                    .order_by(InvoiceDocument.invoice_number)
+                    .all()
+                )
+                self.assertEqual([row.invoice_number for row in numbered], [1, 2, 3])
+                self.assertIn("01-11-2026", numbered[0].filename)
+                self.assertTrue(numbered[0].filename.endswith("_n1.pdf"))
         finally:
             os.environ.pop("AGENDA_DATABASE_URL", None)
             os.remove(db_file.name)

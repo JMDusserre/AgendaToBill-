@@ -30,6 +30,9 @@ class InvoiceDocument(db.Model):
     filename = db.Column(db.String(255), primary_key=True)
     content = db.Column(db.LargeBinary, nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    invoice_number = db.Column(db.Integer, unique=True, nullable=True)
+    montant = db.Column(db.Float, nullable=True)
+    event_key = db.Column(db.String(500), nullable=True)
 
 
 class SyncCache(db.Model):

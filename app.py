@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 import caldav
 from dotenv import load_dotenv
 from flask import Flask, abort, flash, redirect, render_template_string, request, send_file, session, url_for
+from sqlalchemy import inspect, text
 
 import agendatobill.pdf_generator as pdf_generator
 from agendatobill.billing import (
@@ -22,6 +23,7 @@ from agendatobill.billing import (
     match_student,
     parse_event_line,
     should_keep_previous_events,
+    starts_before_day,
 )
 from agendatobill.models import (
     RAW_EVENTS_KEY,
@@ -127,7 +129,9 @@ HTML_TEMPLATE = """
         .calendar-title { font-size: 16px; font-weight: 600; text-transform: capitalize; }
         .calendar-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; }
         .day-name { text-align: center; font-size: 10px; font-weight: 600; color: #8e8e93; margin-bottom: 5px; text-transform: uppercase; }
-        .day-cell { background: white; border-radius: 6px; min-height: 75px; padding: 4px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); display: flex; flex-direction: column; gap: 2px; overflow: hidden; }
+        .day-cell { background: white; border-radius: 6px; min-height: 75px; padding: 4px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); display: flex; flex-direction: column; gap: 2px; }
+        .urssaf-box { background: #f3faf3; border: 1px solid #c8e6c9; border-radius: 8px; padding: 10px; margin: 8px 0 4px 0; }
+        .urssaf-total { font-weight: 700; }
         .day-empty { background: transparent; box-shadow: none; }
         .day-num { font-size: 12px; font-weight: 600; color: #1c1c1e; margin-bottom: 2px; }
         .event-block { font-size: 9px; padding: 3px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.2; }
@@ -181,7 +185,7 @@ HTML_TEMPLATE = """
                     </tr>
                     {% endfor %}
                 </table>
-                <div class="total">Total : {{ total }} €</div>
+                <div class="total">En attente : {{ total }} €</div>
             </div>
             <form action="/generate" method="POST">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -208,6 +212,9 @@ HTML_TEMPLATE = """
                 {% for group in archives %}
                 <details {% if loop.first %}open{% endif %}>
                     <summary>{{ group.month }}</summary>
+                    <div class="urssaf-box">
+                        <div class="urssaf-total">Chiffre d'affaires acté : {{ group.urssaf }} €</div>
+                    </div>
                     <ul class="archive-list">
                     {% for item in group.files %}
                         <li>
@@ -264,6 +271,19 @@ HTML_TEMPLATE = """
             let currentDate = new Date();
             const rawEvents = {{ agenda_events | tojson | safe }};
             
+            function parisDay(iso) {
+                const parts = new Intl.DateTimeFormat('fr-FR', {
+                    timeZone: 'Europe/Paris',
+                    year: 'numeric',
+                    month: '2-digit',
+                    day: '2-digit'
+                }).formatToParts(new Date(iso));
+                const value = function(type) {
+                    return parts.find(function(part) { return part.type === type; }).value;
+                };
+                return value('year') + '-' + value('month') + '-' + value('day');
+            }
+
             function renderCalendar() {
                 const year = currentDate.getFullYear();
                 const month = currentDate.getMonth();
@@ -295,7 +315,7 @@ HTML_TEMPLATE = """
                     cell.appendChild(num);
 
                     rawEvents.forEach(ev => {
-                        if(!ev.iso_start.startsWith(dateString)) return;
+                        if(parisDay(ev.iso_start) !== dateString) return;
                         let cssClass = 'c-avenir';
                         if(ev.status === 'terminé') cssClass = 'c-termine';
                         if(ev.status === 'en cours') cssClass = 'c-encours';
@@ -605,10 +625,23 @@ def calendar_events(calendar, window_start, window_end):
         return calendar.search(start=window_start, end=window_end, event=True)
 
 
+def sync_start_date():
+    raw = (os.environ.get("SYNC_START_DATE") or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError:
+        return False
+
+
 def fetch_icloud_events():
     email, password = icloud_credentials()
     if not email or not password:
         return "Identifiants iCloud manquants. Les cours déjà enregistrés n'ont pas été modifiés."
+    start_limit = sync_start_date()
+    if start_limit is False:
+        return "SYNC_START_DATE illisible. Utilise le format AAAA-MM-JJ. Les cours déjà enregistrés n'ont pas été modifiés."
     try:
         client = caldav.DAVClient(url=CALDAV_URL, username=email, password=password)
         principal = client.principal()
@@ -618,7 +651,10 @@ def fetch_icloud_events():
         failed_calendars = 0
         seen_calendars = 0
         now = datetime.now(timezone.utc)
-        window_start = now - SYNC_PAST
+        if start_limit:
+            window_start = datetime(start_limit.year, start_limit.month, start_limit.day, tzinfo=PARIS)
+        else:
+            window_start = now - SYNC_PAST
         window_end = now + SYNC_FUTURE
 
         for calendar in principal.calendars():
@@ -649,6 +685,8 @@ def fetch_icloud_events():
                         window_end,
                     )
                     for start, end in instances:
+                        if start_limit and starts_before_day(start, start_limit):
+                            continue
                         status = event_status(start, end, now)
                         start_utc = as_utc(start)
                         end_utc = as_utc(end)
@@ -763,7 +801,10 @@ def list_archives_with_info(search_query=""):
 
     for document in documents:
         filename = document.filename
-        label = month_label(document.created_at)
+        if filename.endswith(".pdf"):
+            label = month_label(pdf_generator.course_moment(filename, document.created_at))
+        else:
+            label = month_label(document.created_at)
         if label not in by_month:
             group = {"month": label, "files": []}
             by_month[label] = group
@@ -785,6 +826,10 @@ def list_archives_with_info(search_query=""):
             "filename": filename,
             "student": student_display,
         })
+
+    totals = urssaf_totals()
+    for group in groups:
+        group["urssaf"] = f"{totals.get(group['month'], 0.0):.2f}"
 
     return groups
 
@@ -943,8 +988,14 @@ def delete_file():
     if safe_filename(filename):
         document = db.session.get(InvoiceDocument, filename)
         if document is not None:
+            was_invoice = document.filename.endswith(".pdf")
+            billed = db.session.get(InvoicedEvent, document.event_key) if document.event_key else None
+            if billed is not None:
+                db.session.delete(billed)
             db.session.delete(document)
             db.session.commit()
+            if was_invoice:
+                pdf_generator.refresh_urssaf_recap()
             flash("Fichier supprimé.", "success")
     return redirect_back("/")
 
@@ -998,9 +1049,43 @@ def view_file(filename):
     )
 
 
+def urssaf_totals():
+    pdf_generator.refresh_urssaf_recap()
+    rows = InvoiceDocument.query.filter(InvoiceDocument.filename.endswith(".pdf")).all()
+    totals = {}
+    for row in rows:
+        moment = pdf_generator.course_moment(row.filename, row.created_at)
+        if moment is None:
+            continue
+        label = month_label(moment)
+        totals[label] = totals.get(label, 0.0) + float(row.montant or 0)
+    return totals
+
+
+def ensure_invoice_columns():
+    inspector = inspect(db.engine)
+    if "invoice_document" not in inspector.get_table_names():
+        return
+    names = {column["name"] for column in inspector.get_columns("invoice_document")}
+    amount_type = "DOUBLE PRECISION" if db.engine.dialect.name == "postgresql" else "FLOAT"
+    with db.engine.begin() as connection:
+        if "invoice_number" not in names:
+            connection.execute(text("ALTER TABLE invoice_document ADD COLUMN invoice_number INTEGER"))
+        if "montant" not in names:
+            connection.execute(text(f"ALTER TABLE invoice_document ADD COLUMN montant {amount_type}"))
+        if "event_key" not in names:
+            connection.execute(text("ALTER TABLE invoice_document ADD COLUMN event_key VARCHAR(500)"))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_invoice_document_invoice_number "
+            "ON invoice_document (invoice_number)"
+        ))
+
+
 with app.app_context():
     db.create_all()
+    ensure_invoice_columns()
     import_legacy_files()
+    pdf_generator.assign_invoice_numbers()
 
 
 if __name__ == "__main__":
