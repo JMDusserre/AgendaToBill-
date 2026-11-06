@@ -1,4 +1,3 @@
-import json
 import os
 import tempfile
 import unittest
@@ -115,21 +114,24 @@ class BillingTests(unittest.TestCase):
         self.assertFalse(should_keep_previous_events(0, ""))
 
     def test_process_events_does_not_invent_a_rate_or_rebill(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            previous = os.getcwd()
-            os.chdir(tmp)
-            os.environ["AGENDA_DATA_DIR"] = tmp
-            os.environ["AGENDA_INVOICE_DIR"] = os.path.join(tmp, "factures")
-            try:
-                with open("students.json", "w", encoding="utf-8") as handle:
-                    json.dump({"camille martin": {"tarif": 40, "parent": "", "adresse": ""}}, handle)
-                events = "\n".join([
-                    "2026-11-04T17:00:00+01:00|2026-11-04T18:00:00+01:00|Cours Camille Martin",
-                    "2026-11-04T19:00:00+01:00|2026-11-04T20:30:00+01:00|Cours Camille Martin",
-                    "2026-11-05T17:00:00+01:00|2026-11-05T18:00:00+01:00|Cours Inconnu",
-                ])
-                with open("raw_events.txt", "w", encoding="utf-8") as handle:
-                    handle.write(events)
+        db_file = tempfile.NamedTemporaryFile(prefix="agendatobill-", suffix=".sqlite", delete=False)
+        db_file.close()
+        os.environ["AGENDA_DATABASE_URL"] = "sqlite:///" + db_file.name
+        try:
+            import app as webapp
+            from agendatobill.models import InvoiceDocument, Student, SyncCache, db
+
+            events = "\n".join([
+                "2026-11-04T17:00:00+01:00|2026-11-04T18:00:00+01:00|Cours Camille Martin",
+                "2026-11-04T19:00:00+01:00|2026-11-04T20:30:00+01:00|Cours Camille Martin",
+                "2026-11-05T17:00:00+01:00|2026-11-05T18:00:00+01:00|Cours Inconnu",
+            ])
+            with webapp.app.app_context():
+                db.drop_all()
+                db.create_all()
+                db.session.add(Student(nom="camille martin", tarif=40, parent="", adresse=""))
+                db.session.add(SyncCache(key="raw_events", data_text=events))
+                db.session.commit()
 
                 with mock.patch("builtins.print"):
                     first = pdf_generator.process_events()
@@ -139,16 +141,34 @@ class BillingTests(unittest.TestCase):
                 self.assertTrue(any("inconnu" in warning.lower() for warning in first["warnings"]))
                 self.assertEqual(second["created"], 0)
                 self.assertEqual(second["skipped"], 2)
-                pdfs = [name for name in os.listdir("factures") if name.endswith(".pdf")]
+                pdfs = InvoiceDocument.query.filter(InvoiceDocument.filename.endswith(".pdf")).all()
                 self.assertEqual(len(pdfs), 2)
-                with open("factures/recapitulatif_urssaf.txt", encoding="utf-8") as handle:
-                    recap = handle.read()
-                self.assertIn("CE LOT", recap)
-                self.assertIn("100.00", recap)
-            finally:
-                os.environ.pop("AGENDA_DATA_DIR", None)
-                os.environ.pop("AGENDA_INVOICE_DIR", None)
-                os.chdir(previous)
+                self.assertTrue(all(bytes(row.content).startswith(b"%PDF") for row in pdfs))
+                recap = db.session.get(InvoiceDocument, "recapitulatif_urssaf.txt")
+                text = bytes(recap.content).decode("utf-8")
+                self.assertIn("CE LOT", text)
+                self.assertIn("100.00", text)
+
+                client = webapp.app.test_client()
+                with client.session_transaction() as sess:
+                    sess["logged_in"] = True
+                    sess["csrf_token"] = "token-test"
+                viewed = client.get("/view/" + pdfs[0].filename)
+                self.assertEqual(viewed.status_code, 200)
+                self.assertEqual(viewed.mimetype, "application/pdf")
+                self.assertTrue(viewed.data.startswith(b"%PDF"))
+                archived = client.post("/download_zip", data={"csrf_token": "token-test"})
+                self.assertEqual(archived.status_code, 200)
+                self.assertTrue(archived.data.startswith(b"PK"))
+                removed = client.post("/delete_file", data={
+                    "csrf_token": "token-test",
+                    "filename": pdfs[0].filename,
+                })
+                self.assertEqual(removed.status_code, 302)
+                self.assertIsNone(db.session.get(InvoiceDocument, pdfs[0].filename))
+        finally:
+            os.environ.pop("AGENDA_DATABASE_URL", None)
+            os.remove(db_file.name)
 
 
 if __name__ == "__main__":

@@ -1,14 +1,13 @@
-import json
+import io
 import os
 import secrets
-import shutil
-import tempfile
+import zipfile
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import caldav
 from dotenv import load_dotenv
-from flask import Flask, abort, flash, redirect, render_template_string, request, send_file, send_from_directory, session, url_for
+from flask import Flask, abort, flash, redirect, render_template_string, request, send_file, session, url_for
 
 import agendatobill.pdf_generator as pdf_generator
 from agendatobill.billing import (
@@ -24,16 +23,48 @@ from agendatobill.billing import (
     parse_event_line,
     should_keep_previous_events,
 )
+from agendatobill.models import (
+    RAW_EVENTS_KEY,
+    InvoiceDocument,
+    InvoicedEvent,
+    Student,
+    SyncCache,
+    cache_text,
+    db,
+    invoiced_keys,
+    load_agenda_events,
+    save_sync,
+    students_map,
+)
 from agendatobill.paths import data_file, env_file, invoice_dir
 
 load_dotenv(env_file(), override=True)
+
+
+def database_uri():
+    forced = (os.environ.get("AGENDA_DATABASE_URL") or "").strip()
+    url = forced or (os.environ.get("DATABASE_URL") or "").strip()
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    if url.startswith("postgresql+psycopg://"):
+        url = "postgresql+psycopg2://" + url[len("postgresql+psycopg://"):]
+    elif url.startswith("postgresql://"):
+        url = "postgresql+psycopg2://" + url[len("postgresql://"):]
+    if url:
+        return url
+    return "sqlite:///" + data_file("local.db").as_posix()
+
 
 app = Flask(__name__)
 app.config.update(
     SECRET_KEY=os.environ.get("SECRET_KEY"),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    SQLALCHEMY_DATABASE_URI=database_uri(),
+    SQLALCHEMY_TRACK_MODIFICATIONS=False,
+    SQLALCHEMY_ENGINE_OPTIONS={"pool_pre_ping": True},
 )
+db.init_app(app)
 
 if not app.config["SECRET_KEY"]:
     app.config["SECRET_KEY"] = secrets.token_hex(32)
@@ -420,6 +451,71 @@ LOGIN_TEMPLATE = """
 </html>
 """
 
+def import_legacy_files():
+    """Copie une fois les anciens fichiers si les tables sont encore vides."""
+    import json
+
+    if Student.query.count() == 0:
+        path = data_file("students.json")
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                data = {}
+            if isinstance(data, dict):
+                for nom, info in data.items():
+                    if not isinstance(info, dict) or "tarif" not in info:
+                        continue
+                    nom = str(nom).strip().lower()
+                    if not nom or db.session.get(Student, nom) is not None:
+                        continue
+                    db.session.add(Student(
+                        nom=nom,
+                        tarif=float(info["tarif"]),
+                        parent=(info.get("parent") or ""),
+                        adresse=(info.get("adresse") or ""),
+                    ))
+
+    if db.session.query(InvoicedEvent).count() == 0:
+        path = data_file("invoiced.json")
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                data = []
+            if isinstance(data, list):
+                seen = set()
+                for key in data:
+                    key = str(key or "").strip()
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    db.session.add(InvoicedEvent(event_key=key))
+
+    if db.session.get(SyncCache, RAW_EVENTS_KEY) is None:
+        raw_path = data_file("raw_events.txt")
+        agenda_path = data_file("agenda.json")
+        if raw_path.is_file():
+            db.session.add(SyncCache(key=RAW_EVENTS_KEY, data_text=raw_path.read_text(encoding="utf-8")))
+        if agenda_path.is_file():
+            db.session.add(SyncCache(key="agenda_events", data_text=agenda_path.read_text(encoding="utf-8")))
+
+    if InvoiceDocument.query.count() == 0:
+        folder = invoice_dir()
+        if folder.is_dir():
+            for path in folder.iterdir():
+                if not path.is_file() or path.suffix.lower() not in {".pdf", ".txt"}:
+                    continue
+                modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+                db.session.add(InvoiceDocument(
+                    filename=path.name,
+                    content=path.read_bytes(),
+                    created_at=modified,
+                ))
+
+    db.session.commit()
+
+
 def csrf_token():
     token = session.get("csrf_token")
     if not token:
@@ -468,21 +564,6 @@ def require_login():
         return redirect(url_for("login"))
 
 
-def atomic_write(path, content):
-    path = os.fspath(path)
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, delete=False)
-    try:
-        handle.write(content)
-        handle.close()
-        os.replace(handle.name, path)
-    except Exception:
-        handle.close()
-        if os.path.exists(handle.name):
-            os.remove(handle.name)
-        raise
-
-
 def safe_filename(filename):
     return bool(filename) and os.path.basename(filename) == filename and not filename.startswith(".")
 
@@ -500,14 +581,6 @@ def icloud_credentials():
     email = (os.environ.get("ICLOUD_EMAIL") or "").strip()
     password = (os.environ.get("ICLOUD_PASSWORD") or "").strip()
     return email, password
-
-
-def read_text(path):
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return handle.read()
-    except FileNotFoundError:
-        return ""
 
 
 def rrule_text(vevent):
@@ -535,7 +608,7 @@ def calendar_events(calendar, window_start, window_end):
 def fetch_icloud_events():
     email, password = icloud_credentials()
     if not email or not password:
-        return "Identifiants iCloud manquants dans .env. Les fichiers locaux n'ont pas été modifiés."
+        return "Identifiants iCloud manquants. Les cours déjà enregistrés n'ont pas été modifiés."
     try:
         client = caldav.DAVClient(url=CALDAV_URL, username=email, password=password)
         principal = client.principal()
@@ -590,13 +663,12 @@ def fetch_icloud_events():
                     skipped += 1
 
         if seen_calendars and failed_calendars == seen_calendars:
-            return "Aucun calendrier n'a pu être lu. Les fichiers locaux n'ont pas été modifiés."
-        previous_raw = read_text(data_file("raw_events.txt"))
+            return "Aucun calendrier n'a pu être lu. Les cours déjà enregistrés n'ont pas été modifiés."
+        previous_raw = cache_text(RAW_EVENTS_KEY) or ""
         if should_keep_previous_events(len(agenda_events), previous_raw):
             return "La synchro n'a renvoyé aucun cours. Les cours déjà enregistrés ont été conservés."
 
-        atomic_write(data_file("raw_events.txt"), "\n".join(raw_lines))
-        atomic_write(data_file("agenda.json"), json.dumps(agenda_events, ensure_ascii=False, indent=4))
+        save_sync(raw_lines, agenda_events)
         notes = []
         if failed_calendars:
             notes.append(f"{failed_calendars} calendrier(s) illisible(s) ignoré(s).")
@@ -604,29 +676,12 @@ def fetch_icloud_events():
             notes.append(f"{skipped} événement(s) illisible(s) ignoré(s).")
         return " ".join(notes) or None
     except Exception as exc:
-        return f"Synchro iCloud impossible : {exc}. Les fichiers locaux n'ont pas été modifiés."
-
-
-def load_students():
-    try:
-        with open(data_file("students.json"), "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+        db.session.rollback()
+        return f"Synchro iCloud impossible : {exc}. Les cours déjà enregistrés n'ont pas été modifiés."
 
 
 def load_agenda():
-    try:
-        with open(data_file("agenda.json"), "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        return data if isinstance(data, list) else []
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-
-
-def save_students(data):
-    atomic_write(data_file("students.json"), json.dumps(data, indent=4, ensure_ascii=False))
+    return load_agenda_events()
 
 
 def unique_notes(notes):
@@ -640,16 +695,15 @@ def unique_notes(notes):
 
 
 def get_preview_data():
-    student_db = load_students()
-    invoiced = pdf_generator.load_invoiced()
+    student_db = students_map()
+    invoiced = invoiced_keys()
     preview_data = []
     warnings = []
     total_global = 0.0
-    try:
-        with open(data_file("raw_events.txt"), "r", encoding="utf-8") as handle:
-            lines = handle.read().strip().split("\n")
-    except FileNotFoundError:
+    raw_events = cache_text(RAW_EVENTS_KEY)
+    if raw_events is None:
         return [], "0.00", ["Aucun cours synchronisé."]
+    lines = raw_events.strip().split("\n")
 
     for line in lines:
         if not line.strip():
@@ -691,29 +745,25 @@ FRENCH_MONTHS = [
 ]
 
 
-def month_label(timestamp):
-    moment = datetime.fromtimestamp(timestamp, PARIS)
+def month_label(moment):
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    moment = moment.astimezone(PARIS)
     return f"{FRENCH_MONTHS[moment.month - 1]} {moment.year}"
 
 
 def list_archives_with_info(search_query=""):
-    folder = invoice_dir()
-    if not folder.is_dir():
-        return []
-
-    all_files = [name for name in os.listdir(folder) if name.endswith(".pdf") or name.endswith(".txt")]
-    all_files.sort(key=lambda name: os.path.getmtime(folder / name), reverse=True)
-
+    documents = InvoiceDocument.query.order_by(InvoiceDocument.created_at.desc()).all()
     if search_query:
-        all_files = [name for name in all_files if search_query in name.lower()]
+        documents = [doc for doc in documents if search_query in doc.filename.lower()]
 
-    students = load_students()
+    students = students_map()
     groups = []
     by_month = {}
 
-    for filename in all_files:
-        modified = os.path.getmtime(folder / filename)
-        label = month_label(modified)
+    for document in documents:
+        filename = document.filename
+        label = month_label(document.created_at)
         if label not in by_month:
             group = {"month": label, "files": []}
             by_month[label] = group
@@ -802,16 +852,18 @@ def agenda():
 
 @app.route("/clients", methods=["GET"])
 def clients():
-    students = load_students()
-    client_invoices = {nom: [] for nom in students}
-    folder = invoice_dir()
-    if folder.is_dir():
-        all_files = sorted([name for name in os.listdir(folder) if name.endswith(".pdf")], reverse=True)
-        for nom, data in students.items():
-            parent = data.get("parent", "")
-            client_invoices[nom] = [
-                name for name in all_files if file_matches_person(name, nom.title(), parent)
-            ]
+    students = students_map()
+    filenames = [
+        row.filename
+        for row in InvoiceDocument.query.order_by(InvoiceDocument.created_at.desc()).all()
+        if row.filename.endswith(".pdf")
+    ]
+    client_invoices = {}
+    for nom, data in students.items():
+        parent = data.get("parent", "")
+        client_invoices[nom] = [
+            name for name in filenames if file_matches_person(name, nom.title(), parent)
+        ]
     return render_template_string(
         HTML_TEMPLATE,
         page="clients",
@@ -844,7 +896,7 @@ def save_client():
         flash("Le tarif ne peut pas être négatif.", "warning")
         return redirect("/clients")
 
-    students = load_students()
+    students = students_map()
     conflicts = [
         key for key in students
         if fold_name(key) == fold_name(eleve) and key not in {eleve, original}
@@ -852,12 +904,19 @@ def save_client():
     if conflicts:
         flash("Une autre fiche correspond déjà à ce nom (accents ignorés).", "warning")
         return redirect("/clients")
-    current = dict(students.get(eleve, {}))
     if original and original in students and original != eleve:
-        current = dict(students.pop(original))
-    current.update({"tarif": tarif, "parent": parent, "adresse": adresse})
-    students[eleve] = current
-    save_students(students)
+        previous = db.session.get(Student, original)
+        if previous is not None:
+            db.session.delete(previous)
+            db.session.flush()
+    row = db.session.get(Student, eleve)
+    if row is None:
+        row = Student(nom=eleve)
+        db.session.add(row)
+    row.tarif = tarif
+    row.parent = parent
+    row.adresse = adresse
+    db.session.commit()
     flash("Fiche enregistrée.", "success")
     return redirect("/clients")
 
@@ -865,14 +924,15 @@ def save_client():
 @app.route("/clients/delete", methods=["POST"])
 def delete_client():
     eleve = (request.form.get("eleve") or "").strip()
-    students = load_students()
+    students = students_map()
     if eleve not in students:
         folded = fold_name(eleve)
         matches = [key for key in students if key.lower() == eleve.lower() or fold_name(key) == folded]
         eleve = matches[0] if len(matches) == 1 else ""
-    if eleve in students:
-        del students[eleve]
-        save_students(students)
+    row = db.session.get(Student, eleve) if eleve else None
+    if row is not None:
+        db.session.delete(row)
+        db.session.commit()
         flash("Fiche supprimée.", "success")
     return redirect("/clients")
 
@@ -881,9 +941,10 @@ def delete_client():
 def delete_file():
     filename = request.form.get("filename")
     if safe_filename(filename):
-        filepath = invoice_dir() / filename
-        if os.path.isfile(filepath):
-            os.remove(filepath)
+        document = db.session.get(InvoiceDocument, filename)
+        if document is not None:
+            db.session.delete(document)
+            db.session.commit()
             flash("Fichier supprimé.", "success")
     return redirect_back("/")
 
@@ -904,21 +965,42 @@ def generate():
 
 @app.route("/download_zip", methods=["POST"])
 def download_zip():
-    folder = invoice_dir()
-    if not folder.is_dir():
+    documents = InvoiceDocument.query.order_by(InvoiceDocument.filename).all()
+    if not documents:
         flash("Aucun document à archiver.", "warning")
         return redirect("/")
-    archive = data_file("factures_export")
-    shutil.make_archive(str(archive), "zip", folder)
-    return send_file(str(archive) + ".zip", as_attachment=True)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for document in documents:
+            archive.writestr(document.filename, bytes(document.content))
+    buffer.seek(0)
+    return send_file(
+        buffer,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name="factures_export.zip",
+    )
 
 
 @app.route("/view/<filename>")
 def view_file(filename):
     if not safe_filename(filename):
         abort(404)
+    document = db.session.get(InvoiceDocument, filename)
+    if document is None:
+        abort(404)
     mimetype = "application/pdf" if filename.endswith(".pdf") else "text/plain"
-    return send_from_directory(invoice_dir(), filename, as_attachment=False, mimetype=mimetype)
+    return send_file(
+        io.BytesIO(bytes(document.content)),
+        mimetype=mimetype,
+        as_attachment=False,
+        download_name=filename,
+    )
+
+
+with app.app_context():
+    db.create_all()
+    import_legacy_files()
 
 
 if __name__ == "__main__":
