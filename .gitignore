@@ -1,1 +1,13 @@
 .env
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+factures/
+factures_export.zip
+students.json
+agenda.json
+raw_events.txt
+invoiced.json
+ip.txt
+ids.txt

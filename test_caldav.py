@@ -1,40 +1,39 @@
-import caldav
-from datetime import datetime
+import os
 
-USERNAME = "jean-michel.dusserre@hotmail.fr"
-PASSWORD = "REMOVED"
+import caldav
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
 CALDAV_URL = "https://caldav.icloud.com/"
 
+
 def test_icloud_connection():
+    username = (os.environ.get("ICLOUD_EMAIL") or "").strip()
+    password = (os.environ.get("ICLOUD_PASSWORD") or "").strip()
+    if not username or not password:
+        raise SystemExit("Renseigne ICLOUD_EMAIL et ICLOUD_PASSWORD dans .env.")
+
     try:
-        client = caldav.DAVClient(
-            url=CALDAV_URL,
-            username=USERNAME,
-            password=PASSWORD
-        )
-        
+        client = caldav.DAVClient(url=CALDAV_URL, username=username, password=password)
         principal = client.principal()
         calendars = principal.calendars()
-        print(f"✅ Connexion réussie ! {len(calendars)} calendrier(s) trouvé(s).")
-        
+        print(f"Connexion reussie. {len(calendars)} calendrier(s) trouve(s).")
+
         for calendar in calendars:
-            # Utilisation de la nouvelle méthode recommandée pour le nom
             print(f"- Calendrier : {calendar.get_display_name()}")
-            events = calendar.events()
-            for event in events:
+            for event in calendar.events():
                 try:
-                    # On extrait le résumé (titre) via le composant iCalendar
                     vevent = event.vobject_instance.vevent
-                    summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else ""
-                    dtstart = str(vevent.dtstart.value) if hasattr(vevent, 'dtstart') else ""
-                    
+                    summary = str(vevent.summary.value) if hasattr(vevent, "summary") else ""
+                    dtstart = str(vevent.dtstart.value) if hasattr(vevent, "dtstart") else ""
                     if "cours" in summary.lower():
-                        print(f"   🎸 Trouvé : {summary} (Début : {dtstart})")
+                        print(f"   Trouve : {summary} (debut : {dtstart})")
                 except Exception:
                     continue
-                    
-    except Exception as e:
-        print(f"❌ Erreur de connexion CalDAV : {e}")
+    except Exception as exc:
+        print(f"Erreur de connexion CalDAV : {exc}")
+
 
 if __name__ == "__main__":
     test_icloud_connection()

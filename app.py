@@ -1,20 +1,45 @@
-import os
-from flask import Flask, request, render_template_string, redirect, send_file, send_from_directory
 import json
-from datetime import datetime, timezone
+import os
+import secrets
 import shutil
+import tempfile
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
+
 import caldav
-import pdf_generator
 from dotenv import load_dotenv
+from flask import Flask, abort, flash, redirect, render_template_string, request, send_file, send_from_directory, session
+
+import pdf_generator
+from billing import (
+    PARIS,
+    as_utc,
+    duration_hours,
+    event_key,
+    event_status,
+    expand_occurrences,
+    file_matches_person,
+    fold_name,
+    match_student,
+    parse_event_line,
+    should_keep_previous_events,
+)
+
+load_dotenv(override=True)
 
 app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=os.environ.get("SECRET_KEY"),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
 
+if not app.config["SECRET_KEY"]:
+    app.config["SECRET_KEY"] = secrets.token_hex(32)
 
-load_dotenv()
-
-USERNAME = os.environ.get("ICLOUD_EMAIL")
-PASSWORD = os.environ.get("ICLOUD_PASSWORD")
 CALDAV_URL = "https://caldav.icloud.com/"
+SYNC_PAST = timedelta(days=120)
+SYNC_FUTURE = timedelta(days=62)
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -40,6 +65,7 @@ HTML_TEMPLATE = """
         
         .total { font-size: 22px; font-weight: 700; text-align: right; color: #000; margin-top: 10px; }
         .success { background: #d4edda; color: #155724; padding: 15px; border-radius: 12px; font-weight: bold; margin-bottom: 20px; text-align: center;}
+        .warning { background: #fff3cd; color: #856404; padding: 15px; border-radius: 12px; font-weight: 600; margin-bottom: 12px; text-align: center;}
         
         .form-group { margin-bottom: 15px; }
         label { display: block; font-size: 14px; font-weight: 600; margin-bottom: 5px; color: #3a3a3c; }
@@ -76,18 +102,30 @@ HTML_TEMPLATE = """
     <script>
         function editClient(btn) {
             document.getElementById('form-eleve').value = btn.getAttribute('data-nom');
+            document.getElementById('form-original').value = btn.getAttribute('data-nom');
             document.getElementById('form-tarif').value = btn.getAttribute('data-tarif');
             document.getElementById('form-parent').value = btn.getAttribute('data-parent');
             document.getElementById('form-adresse').value = btn.getAttribute('data-adresse');
             window.scrollTo({ top: 0, behavior: 'smooth' });
         }
+        function resetClientForm() {
+            ['form-eleve', 'form-original', 'form-tarif', 'form-parent', 'form-adresse'].forEach(function(id) {
+                var field = document.getElementById(id);
+                if (field) field.value = '';
+            });
+        }
     </script>
 </head>
 <body>
     
-    {% if success %}
-        <div class="success">✅ Action réussie !</div>
-    {% endif %}
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for category, message in messages %}
+            <div class="{{ 'success' if category == 'success' else 'warning' }}">{{ message }}</div>
+        {% endfor %}
+    {% endwith %}
+    {% for note in notices or [] %}
+        <div class="warning">{{ note }}</div>
+    {% endfor %}
 
     {% if page == 'factures' %}
         <h2>🎸 Facturation</h2>
@@ -107,6 +145,7 @@ HTML_TEMPLATE = """
                 <div class="total">Total : {{ total }} €</div>
             </div>
             <form action="/generate" method="POST">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <button type="submit" class="btn">1. Générer les factures</button>
             </form>
         {% else %}
@@ -130,13 +169,15 @@ HTML_TEMPLATE = """
                     <li>
                         <a href="/view/{{ file }}" target="_blank">📄 {{ file }}</a>
                         <form action="/delete_file" method="POST" style="margin:0;" onsubmit="return confirm('Supprimer ce fichier définitivement ?');">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                             <input type="hidden" name="filename" value="{{ file }}">
                             <button type="submit" class="delete-icon" title="Supprimer">🗑️</button>
                         </form>
                     </li>
                 {% endfor %}
                 </ul>
-                <form action="/download_zip" method="GET" style="margin-top: 20px;">
+                <form action="/download_zip" method="POST" style="margin-top: 20px;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <button type="submit" class="btn btn-success">2. Télécharger l'archive ZIP</button>
                 </form>
             {% else %}
@@ -184,29 +225,42 @@ HTML_TEMPLATE = """
                 
                 let startOffset = firstDay === 0 ? 6 : firstDay - 1;
                 for(let i=0; i<startOffset; i++) {
-                    grid.innerHTML += '<div class="day-cell day-empty"></div>';
+                    const empty = document.createElement('div');
+                    empty.className = 'day-cell day-empty';
+                    grid.appendChild(empty);
                 }
                 
                 for(let d=1; d<=daysInMonth; d++) {
                     const monthStr = String(month + 1).padStart(2, '0');
                     const dayStr = String(d).padStart(2, '0');
                     const dateString = year + '-' + monthStr + '-' + dayStr;
-                    
-                    let eventsHtml = '';
+                    const cell = document.createElement('div');
+                    cell.className = 'day-cell';
+                    const num = document.createElement('div');
+                    num.className = 'day-num';
+                    num.textContent = String(d);
+                    cell.appendChild(num);
+
                     rawEvents.forEach(ev => {
-                        if(ev.iso_start.startsWith(dateString)) {
-                            let cssClass = 'c-avenir';
-                            if(ev.status === 'terminé') cssClass = 'c-termine';
-                            if(ev.status === 'en cours') cssClass = 'c-encours';
-                            
-                            const eventDate = new Date(ev.iso_start);
-                            const timeStr = eventDate.toLocaleTimeString('fr-FR', {hour: '2-digit', minute:'2-digit'});
-                            
-                            eventsHtml += '<div class="event-block ' + cssClass + '"><span style="opacity: 0.65; margin-right: 3px;">' + timeStr + '</span>' + ev.summary + '</div>';
-                        }
+                        if(!ev.iso_start.startsWith(dateString)) return;
+                        let cssClass = 'c-avenir';
+                        if(ev.status === 'terminé') cssClass = 'c-termine';
+                        if(ev.status === 'en cours') cssClass = 'c-encours';
+                        const eventDate = new Date(ev.iso_start);
+                        const timeStr = eventDate.toLocaleTimeString('fr-FR', {hour: '2-digit', minute:'2-digit'});
+                        const block = document.createElement('div');
+                        block.className = 'event-block ' + cssClass;
+                        const time = document.createElement('span');
+                        time.style.opacity = '0.65';
+                        time.style.marginRight = '3px';
+                        time.textContent = timeStr;
+                        const label = document.createElement('span');
+                        label.textContent = ev.summary;
+                        block.appendChild(time);
+                        block.appendChild(label);
+                        cell.appendChild(block);
                     });
-                    
-                    grid.innerHTML += '<div class="day-cell"><div class="day-num">' + d + '</div>' + eventsHtml + '</div>';
+                    grid.appendChild(cell);
                 }
             }
             
@@ -225,6 +279,8 @@ HTML_TEMPLATE = """
         <div class="card" style="background: #eef7ff; border: 1px solid #b6d4fe;">
             <h3 style="margin-top: 0; font-size: 16px; color: #0056b3;">Ajouter / Modifier un élève</h3>
             <form action="/clients/save" method="POST">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" id="form-original" name="original" value="">
                 <div class="form-group">
                     <label>Nom de l'élève (agenda)</label>
                     <input type="text" id="form-eleve" name="eleve" required>
@@ -242,6 +298,7 @@ HTML_TEMPLATE = """
                     <input type="text" id="form-adresse" name="adresse">
                 </div>
                 <button type="submit" class="btn" style="padding: 12px; font-size: 15px;">Enregistrer la fiche</button>
+                <button type="button" class="btn-edit" onclick="resetClientForm()">Nouvelle fiche</button>
             </form>
         </div>
 
@@ -261,6 +318,7 @@ HTML_TEMPLATE = """
                     <li>
                         <a href="/view/{{ file }}" target="_blank" style="font-size: 14px;">📄 {{ file }}</a>
                         <form action="/delete_file" method="POST" style="margin:0;" onsubmit="return confirm('Supprimer la facture de {{ nom.title() }} ?');">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                             <input type="hidden" name="filename" value="{{ file }}">
                             <button type="submit" class="delete-icon" title="Supprimer">🗑️</button>
                         </form>
@@ -279,6 +337,7 @@ HTML_TEMPLATE = """
                     ✏️ Modifier
                 </button>
                 <form action="/clients/delete" method="POST" style="margin: 0;" onsubmit="return confirm('Supprimer définitivement la fiche de {{ nom.title() }} ?');">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <input type="hidden" name="eleve" value="{{ nom }}">
                     <button type="submit" class="delete-icon" style="font-size: 20px; padding: 10px;" title="Supprimer">🗑️</button>
                 </form>
@@ -302,184 +361,419 @@ HTML_TEMPLATE = """
 </html>
 """
 
-def fetch_icloud_events():
+def csrf_token():
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+
+def validate_csrf():
+    token = request.form.get("csrf_token", "")
+    expected = session.get("csrf_token", "")
+    if not token or not expected or not secrets.compare_digest(token, expected):
+        abort(400)
+
+
+@app.context_processor
+def inject_csrf():
+    return {"csrf_token": csrf_token()}
+
+
+@app.before_request
+def check_csrf():
+    if request.method == "POST":
+        validate_csrf()
+
+
+def atomic_write(path, content):
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory, delete=False)
     try:
-        client = caldav.DAVClient(url=CALDAV_URL, username=USERNAME, password=PASSWORD)
+        handle.write(content)
+        handle.close()
+        os.replace(handle.name, path)
+    except Exception:
+        handle.close()
+        if os.path.exists(handle.name):
+            os.remove(handle.name)
+        raise
+
+
+def safe_filename(filename):
+    return bool(filename) and os.path.basename(filename) == filename and not filename.startswith(".")
+
+
+def redirect_back(fallback):
+    parsed = urlparse(request.referrer or "")
+    if parsed.netloc == request.host and parsed.path.startswith("/") and not parsed.path.startswith("//"):
+        query = f"?{parsed.query}" if parsed.query else ""
+        return redirect(parsed.path + query)
+    return redirect(fallback)
+
+
+def icloud_credentials():
+    load_dotenv(override=True)
+    email = (os.environ.get("ICLOUD_EMAIL") or "").strip()
+    password = (os.environ.get("ICLOUD_PASSWORD") or "").strip()
+    return email, password
+
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return ""
+
+
+def rrule_text(vevent):
+    if not hasattr(vevent, "rrule"):
+        return None
+    value = vevent.rrule.value
+    return value if isinstance(value, str) else str(value)
+
+
+def exdates_of(vevent):
+    if not hasattr(vevent, "exdate"):
+        return []
+    value = vevent.exdate.value
+    items = value if isinstance(value, list) else [value]
+    return [item for item in items if isinstance(item, datetime)]
+
+
+def calendar_events(calendar, window_start, window_end):
+    try:
+        return calendar.search(start=window_start, end=window_end, event=True, expand=True)
+    except TypeError:
+        return calendar.search(start=window_start, end=window_end, event=True)
+
+
+def fetch_icloud_events():
+    email, password = icloud_credentials()
+    if not email or not password:
+        return "Identifiants iCloud manquants dans .env. Les fichiers locaux n'ont pas été modifiés."
+    try:
+        client = caldav.DAVClient(url=CALDAV_URL, username=email, password=password)
         principal = client.principal()
         raw_lines = []
         agenda_events = []
+        skipped = 0
+        failed_calendars = 0
+        seen_calendars = 0
         now = datetime.now(timezone.utc)
-        
+        window_start = now - SYNC_PAST
+        window_end = now + SYNC_FUTURE
+
         for calendar in principal.calendars():
+            seen_calendars += 1
             try:
-                for event in calendar.events():
-                    try:
-                        vevent = event.vobject_instance.vevent
-                        summary = str(vevent.summary.value) if hasattr(vevent, 'summary') else ""
-                        if "cours" not in summary.lower():
-                            continue
-                        
-                        dtstart = vevent.dtstart.value
-                        dtend = vevent.dtend.value if hasattr(vevent, 'dtend') else dtstart
-                        
-                        if type(dtstart) is not datetime:
-                            continue
-                            
-                        end_time_utc = dtend.astimezone(timezone.utc) if dtend.tzinfo else dtend.replace(tzinfo=timezone.utc)
-                        start_time_utc = dtstart.astimezone(timezone.utc) if dtstart.tzinfo else dtstart.replace(tzinfo=timezone.utc)
-                        
-                        duration = (dtend - dtstart).total_seconds() / 3600
-                        
-                        if end_time_utc <= now:
-                            status = 'terminé'
-                            raw_lines.append(f"{dtstart.isoformat()}|{dtend.isoformat()}|{summary}")
-                        elif start_time_utc <= now < end_time_utc:
-                            status = 'en cours'
-                        else:
-                            status = 'à venir'
-                            
-                        agenda_events.append({
-                            "iso_start": dtstart.isoformat(),
-                            "summary": summary.replace("cours", "").strip().title(),
-                            "status": status
-                        })
-                    except Exception:
-                        continue
+                events = calendar_events(calendar, window_start, window_end)
             except Exception:
+                failed_calendars += 1
                 continue
-                
-        with open('raw_events.txt', 'w', encoding='utf-8') as f:
-            f.write('\n'.join(raw_lines))
-            
-        with open('agenda.json', 'w', encoding='utf-8') as f:
-            json.dump(agenda_events, f, ensure_ascii=False, indent=4)
-            
-    except Exception as e:
-        print(f"Erreur de synchronisation CalDAV : {e}")
+            for event in events:
+                try:
+                    vevent = event.vobject_instance.vevent
+                    summary = str(vevent.summary.value) if hasattr(vevent, "summary") else ""
+                    if "cours" not in summary.lower():
+                        continue
+                    summary = summary.replace("|", " ").strip()
+                    dtstart = vevent.dtstart.value
+                    dtend = vevent.dtend.value if hasattr(vevent, "dtend") else dtstart
+                    if not isinstance(dtstart, datetime) or not isinstance(dtend, datetime):
+                        skipped += 1
+                        continue
+                    instances = expand_occurrences(
+                        dtstart,
+                        dtend,
+                        rrule_text(vevent),
+                        exdates_of(vevent),
+                        window_start,
+                        window_end,
+                    )
+                    for start, end in instances:
+                        status = event_status(start, end, now)
+                        start_utc = as_utc(start)
+                        end_utc = as_utc(end)
+                        if status == "terminé":
+                            raw_lines.append(f"{start_utc.isoformat()}|{end_utc.isoformat()}|{summary}")
+                        agenda_events.append({
+                            "iso_start": start_utc.isoformat(),
+                            "summary": summary,
+                            "status": status,
+                        })
+                except Exception:
+                    skipped += 1
+
+        if seen_calendars and failed_calendars == seen_calendars:
+            return "Aucun calendrier n'a pu être lu. Les fichiers locaux n'ont pas été modifiés."
+        previous_raw = read_text("raw_events.txt")
+        if should_keep_previous_events(len(agenda_events), previous_raw):
+            return "La synchro n'a renvoyé aucun cours. Les cours déjà enregistrés ont été conservés."
+
+        atomic_write("raw_events.txt", "\n".join(raw_lines))
+        atomic_write("agenda.json", json.dumps(agenda_events, ensure_ascii=False, indent=4))
+        notes = []
+        if failed_calendars:
+            notes.append(f"{failed_calendars} calendrier(s) illisible(s) ignoré(s).")
+        if skipped:
+            notes.append(f"{skipped} événement(s) illisible(s) ignoré(s).")
+        return " ".join(notes) or None
+    except Exception as exc:
+        return f"Synchro iCloud impossible : {exc}. Les fichiers locaux n'ont pas été modifiés."
+
 
 def load_students():
     try:
-        with open('students.json', 'r', encoding='utf-8') as f: return json.load(f)
-    except Exception: return {}
+        with open("students.json", "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
 
 def load_agenda():
     try:
-        with open('agenda.json', 'r', encoding='utf-8') as f: return json.load(f)
-    except Exception: return []
+        with open("agenda.json", "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
 
 def save_students(data):
-    with open('students.json', 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+    atomic_write("students.json", json.dumps(data, indent=4, ensure_ascii=False))
+
+
+def unique_notes(notes):
+    seen = set()
+    ordered = []
+    for note in notes:
+        if note and note not in seen:
+            seen.add(note)
+            ordered.append(note)
+    return ordered
+
 
 def get_preview_data():
     student_db = load_students()
+    invoiced = pdf_generator.load_invoiced()
     preview_data = []
+    warnings = []
     total_global = 0.0
     try:
-        with open('raw_events.txt', 'r', encoding='utf-8') as file:
-            lines = file.read().strip().split('\n')
-        for line in lines:
-            if not line.strip(): continue
-            start_str, end_str, raw_name = line.split('|')
-            if "cours" not in raw_name.lower(): continue
-            start_time = datetime.fromisoformat(start_str.strip())
-            end_time = datetime.fromisoformat(end_str.strip())
-            duration = (end_time - start_time).total_seconds() / 3600
-            clean_name = raw_name.lower().replace("cours", "").strip()
-            rate = student_db.get(clean_name, {}).get("tarif", 30.0)
-            montant = duration * rate
-            total_global += montant
-            preview_data.append({"date": start_time.strftime("%d/%m"), "nom": clean_name.title(), "duree": duration, "montant": f"{montant:.0f}"})
-    except Exception: pass
-    return preview_data, f"{total_global:.2f}"
+        with open("raw_events.txt", "r", encoding="utf-8") as handle:
+            lines = handle.read().strip().split("\n")
+    except FileNotFoundError:
+        return [], "0.00", ["Aucun cours synchronisé."]
 
-@app.route('/', methods=['GET'])
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            start, end, raw_name = parse_event_line(line)
+        except ValueError as exc:
+            warnings.append(str(exc))
+            continue
+        if "cours" not in raw_name.lower():
+            continue
+        if event_key(start, end, raw_name) in invoiced:
+            continue
+        student_key, error = match_student(raw_name, student_db)
+        if error:
+            warnings.append(error)
+            continue
+        if "tarif" not in student_db[student_key]:
+            warnings.append(f"Tarif manquant pour {student_key}.")
+            continue
+        duration = duration_hours(start, end)
+        if duration <= 0:
+            warnings.append(f"Durée invalide pour {raw_name}.")
+            continue
+        montant = duration * float(student_db[student_key]["tarif"])
+        total_global += montant
+        preview_data.append({
+            "date": as_utc(start).astimezone(PARIS).strftime("%d/%m"),
+            "nom": student_key.title(),
+            "duree": f"{duration:.2f}",
+            "montant": f"{montant:.2f}",
+        })
+    return preview_data, f"{total_global:.2f}", unique_notes(warnings)
+
+
+def list_archives(search_query=""):
+    if not os.path.isdir("factures"):
+        return []
+    all_files = sorted(
+        [name for name in os.listdir("factures") if name.endswith(".pdf") or name.endswith(".txt")],
+        reverse=True,
+    )
+    if search_query:
+        return [name for name in all_files if search_query in name.lower()]
+    return all_files
+
+
+@app.route("/", methods=["GET"])
 def index():
-    success = request.args.get('success')
-    search_query = request.args.get('search', '').strip().lower()
-    
+    search_query = request.args.get("search", "").strip().lower()
+    notices = []
     if not search_query:
-        fetch_icloud_events()
-        
-    preview_data, total = get_preview_data()
-    archives = []
-    
-    if os.path.exists('factures'):
-        all_files = sorted([f for f in os.listdir('factures') if f.endswith('.pdf') or f.endswith('.txt')], reverse=True)
-        if search_query:
-            archives = [f for f in all_files if search_query in f.lower()]
-        else:
-            archives = all_files
+        sync_error = fetch_icloud_events()
+        if sync_error:
+            notices.append(sync_error)
+    preview_data, total, warnings = get_preview_data()
+    notices.extend(warnings)
+    return render_template_string(
+        HTML_TEMPLATE,
+        page="factures",
+        preview_data=preview_data,
+        total=total,
+        archives=list_archives(search_query),
+        search_query=search_query,
+        notices=unique_notes(notices),
+        agenda_events=[],
+        students={},
+        client_invoices={},
+    )
 
-    return render_template_string(HTML_TEMPLATE, page='factures', preview_data=preview_data, total=total, success=success, archives=archives, search_query=search_query)
 
-@app.route('/agenda', methods=['GET'])
+@app.route("/agenda", methods=["GET"])
 def agenda():
-    fetch_icloud_events()
-    agenda_events = load_agenda()
-    return render_template_string(HTML_TEMPLATE, page='agenda', agenda_events=agenda_events)
+    sync_error = fetch_icloud_events()
+    notices = [sync_error] if sync_error else []
+    return render_template_string(
+        HTML_TEMPLATE,
+        page="agenda",
+        agenda_events=load_agenda(),
+        notices=notices,
+        preview_data=[],
+        total="0.00",
+        archives=[],
+        search_query="",
+        students={},
+        client_invoices={},
+    )
 
-@app.route('/clients', methods=['GET'])
+
+@app.route("/clients", methods=["GET"])
 def clients():
-    success = request.args.get('success')
     students = load_students()
-    client_invoices = {nom: [] for nom in students.keys()}
-    
-    if os.path.exists('factures'):
-        all_files = sorted([f for f in os.listdir('factures') if f.endswith('.pdf')], reverse=True)
+    client_invoices = {nom: [] for nom in students}
+    if os.path.isdir("factures"):
+        all_files = sorted([name for name in os.listdir("factures") if name.endswith(".pdf")], reverse=True)
         for nom, data in students.items():
-            safe_student = nom.title().replace(" ", "_").replace("/", "-")
-            safe_parent = data.get('parent', '').replace(" ", "_").replace("/", "-") if data.get('parent') else ""
-            
-            for f in all_files:
-                if safe_student.lower() in f.lower() or (safe_parent and safe_parent.lower() in f.lower()):
-                    client_invoices[nom].append(f)
+            parent = data.get("parent", "")
+            client_invoices[nom] = [
+                name for name in all_files if file_matches_person(name, nom.title(), parent)
+            ]
+    return render_template_string(
+        HTML_TEMPLATE,
+        page="clients",
+        students=students,
+        client_invoices=client_invoices,
+        notices=[],
+        preview_data=[],
+        total="0.00",
+        archives=[],
+        search_query="",
+        agenda_events=[],
+    )
 
-    return render_template_string(HTML_TEMPLATE, page='clients', students=students, success=success, client_invoices=client_invoices)
 
-@app.route('/clients/save', methods=['POST'])
+@app.route("/clients/save", methods=["POST"])
 def save_client():
-    eleve = request.form.get('eleve').strip().lower()
-    tarif = float(request.form.get('tarif'))
-    parent = request.form.get('parent', '').strip()
-    adresse = request.form.get('adresse', '').strip()
-    students = load_students()
-    students[eleve] = {"tarif": tarif, "parent": parent, "adresse": adresse}
-    save_students(students)
-    return redirect('/clients?success=1')
+    eleve = (request.form.get("eleve") or "").strip().lower()
+    original = (request.form.get("original") or "").strip()
+    parent = (request.form.get("parent") or "").strip()
+    adresse = (request.form.get("adresse") or "").strip()
+    if not eleve:
+        flash("Le nom de l'élève est obligatoire.", "warning")
+        return redirect("/clients")
+    try:
+        tarif = float(request.form.get("tarif") or "")
+    except ValueError:
+        flash("Le tarif doit être un nombre.", "warning")
+        return redirect("/clients")
+    if tarif < 0:
+        flash("Le tarif ne peut pas être négatif.", "warning")
+        return redirect("/clients")
 
-@app.route('/clients/delete', methods=['POST'])
-def delete_client():
-    eleve = request.form.get('eleve').strip()
     students = load_students()
+    conflicts = [
+        key for key in students
+        if fold_name(key) == fold_name(eleve) and key not in {eleve, original}
+    ]
+    if conflicts:
+        flash("Une autre fiche correspond déjà à ce nom (accents ignorés).", "warning")
+        return redirect("/clients")
+    current = dict(students.get(eleve, {}))
+    if original and original in students and original != eleve:
+        current = dict(students.pop(original))
+    current.update({"tarif": tarif, "parent": parent, "adresse": adresse})
+    students[eleve] = current
+    save_students(students)
+    flash("Fiche enregistrée.", "success")
+    return redirect("/clients")
+
+
+@app.route("/clients/delete", methods=["POST"])
+def delete_client():
+    eleve = (request.form.get("eleve") or "").strip()
+    students = load_students()
+    if eleve not in students:
+        folded = fold_name(eleve)
+        matches = [key for key in students if key.lower() == eleve.lower() or fold_name(key) == folded]
+        eleve = matches[0] if len(matches) == 1 else ""
     if eleve in students:
         del students[eleve]
         save_students(students)
-    return redirect('/clients?success=1')
+        flash("Fiche supprimée.", "success")
+    return redirect("/clients")
 
-@app.route('/delete_file', methods=['POST'])
+
+@app.route("/delete_file", methods=["POST"])
 def delete_file():
-    filename = request.form.get('filename')
-    if filename and '/' not in filename and '\\' not in filename:
-        filepath = os.path.join('factures', filename)
-        if os.path.exists(filepath):
+    filename = request.form.get("filename")
+    if safe_filename(filename):
+        filepath = os.path.join("factures", filename)
+        if os.path.isfile(filepath):
             os.remove(filepath)
-    return redirect(request.referrer or '/?success=1')
+            flash("Fichier supprimé.", "success")
+    return redirect_back("/")
 
-@app.route('/generate', methods=['POST'])
+
+@app.route("/generate", methods=["POST"])
 def generate():
-    pdf_generator.process_events()
-    return redirect('/?success=1')
+    result = pdf_generator.process_events()
+    if result["created"]:
+        flash(f"{result['created']} facture(s) créée(s).", "success")
+    else:
+        flash("Aucune nouvelle facture créée.", "warning")
+    if result["skipped"]:
+        flash(f"{result['skipped']} cours déjà facturé(s), ignoré(s).", "warning")
+    for warning in unique_notes(result["warnings"]):
+        flash(warning, "warning")
+    return redirect("/")
 
-@app.route('/download_zip', methods=['GET'])
+
+@app.route("/download_zip", methods=["POST"])
 def download_zip():
-    shutil.make_archive('factures_export', 'zip', 'factures')
-    return send_file('factures_export.zip', as_attachment=True)
+    if not os.path.isdir("factures"):
+        flash("Aucun document à archiver.", "warning")
+        return redirect("/")
+    shutil.make_archive("factures_export", "zip", "factures")
+    return send_file("factures_export.zip", as_attachment=True)
 
-@app.route('/view/<filename>')
+
+@app.route("/view/<filename>")
 def view_file(filename):
-    mimetype = 'application/pdf' if filename.endswith('.pdf') else 'text/plain'
-    return send_from_directory('factures', filename, as_attachment=False, mimetype=mimetype)
+    if not safe_filename(filename):
+        abort(404)
+    mimetype = "application/pdf" if filename.endswith(".pdf") else "text/plain"
+    return send_from_directory("factures", filename, as_attachment=False, mimetype=mimetype)
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5001, debug=False)
