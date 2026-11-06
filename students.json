@@ -1,0 +1,21 @@
+{
+    "clement bresson": {
+        "tarif": 80.0,
+        "parent": "",
+        "adresse": ""
+    },
+    "laura clément": {
+        "origine": "superprof",
+        "tarif": 22.5
+    },
+    "clément bresson": {
+        "tarif": 30.0,
+        "parent": "M. Jean Bresson",
+        "adresse": "10, rue de la Paix, 69001 Paris"
+    },
+    "jean-michel dusserre": {
+        "tarif": 30.0,
+        "parent": "Martine Dusserre",
+        "adresse": "10 rue des bois"
+    }
+}
