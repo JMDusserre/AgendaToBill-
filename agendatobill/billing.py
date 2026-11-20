@@ -8,15 +8,41 @@ from dateutil.rrule import rrulestr
 PARIS = ZoneInfo("Europe/Paris")
 
 
-def fold_name(value):
-    """Nom comparable : minuscules, sans accents, préfixe « cours » retiré une fois."""
+SELECTION_KEYWORDS = ("cours", "rdv", "coaching", "consultation")
+
+
+def fold_text(value):
+    """Texte comparable : minuscules, sans accents."""
     text = unicodedata.normalize("NFD", value or "")
     text = "".join(char for char in text if unicodedata.category(char) != "Mn")
     text = text.lower().replace("’", "'").replace("`", "'")
     text = re.sub(r"[^a-z0-9' -]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"^cours\b\s*", "", text).strip()
     return text
+
+
+def fold_name(value):
+    """Nom comparable : minuscules, sans accents, préfixe « cours » retiré une fois."""
+    return re.sub(r"^cours\b\s*", "", fold_text(value)).strip()
+
+
+def is_all_day(start, end):
+    """Vrai pour un événement sur une date seule ou d'une durée d'au moins un jour."""
+    if not isinstance(start, datetime) or not isinstance(end, datetime):
+        return True
+    return (as_utc(end) - as_utc(start)) >= timedelta(days=1)
+
+
+def pre_selected(title, students):
+    """Coche proposée si le titre évoque un cours ou contient un élève connu."""
+    folded = fold_text(title)
+    if any(re.search(rf"\b{keyword}\b", folded) for keyword in SELECTION_KEYWORDS):
+        return True
+    for key in students or {}:
+        name = fold_name(key)
+        if name and re.search(rf"\b{re.escape(name)}\b", folded):
+            return True
+    return False
 
 
 def ensure_aware(dt):

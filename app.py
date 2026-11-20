@@ -20,8 +20,10 @@ from agendatobill.billing import (
     expand_occurrences,
     file_matches_person,
     fold_name,
+    is_all_day,
     match_student,
     parse_event_line,
+    pre_selected,
     should_keep_previous_events,
     starts_before_day,
 )
@@ -132,6 +134,8 @@ HTML_TEMPLATE = """
         .day-cell { background: white; border-radius: 6px; min-height: 75px; padding: 4px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); display: flex; flex-direction: column; gap: 2px; }
         .urssaf-box { background: #f3faf3; border: 1px solid #c8e6c9; border-radius: 8px; padding: 10px; margin: 8px 0 4px 0; }
         .urssaf-total { font-weight: 700; }
+        .pick { width: 18px; height: 18px; margin: 0; }
+        .row-note { display: block; color: #8e8e93; font-size: 12px; font-weight: 500; }
         .day-empty { background: transparent; box-shadow: none; }
         .day-num { font-size: 12px; font-weight: 600; color: #1c1c1e; margin-bottom: 2px; }
         .event-block { font-size: 9px; padding: 3px; border-radius: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.2; }
@@ -170,30 +174,31 @@ HTML_TEMPLATE = """
     {% if page == 'factures' %}
         <h2>🎸 Facturation</h2>
         {% if preview_data %}
-            <div class="card">
-                <p style="font-size: 13px; color: #8e8e93; margin-top: 0; margin-bottom: 15px;">
-                        Voici la liste des cours passés qui sont en attente d'être facturés.
-                </p>
-                <table>
-                    <tr><th>Élève</th><th>Date</th><th>Durée</th><th>€</th></tr>
-                    {% for row in preview_data %}
-                    <tr>
-                        <td>{{ row.nom }}</td>
-                        <td>{{ row.date }}</td>
-                        <td>{{ row.duree }}h</td>
-                        <td>{{ row.montant }}</td>
-                    </tr>
-                    {% endfor %}
-                </table>
-                <div class="total">En attente : {{ total }} €</div>
-            </div>
             <form action="/generate" method="POST">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                <button type="submit" class="btn">1. Générer les factures</button>
+                <div class="card">
+                    <p style="font-size: 13px; color: #8e8e93; margin-top: 0; margin-bottom: 15px;">
+                        Coche les événements à facturer. Les cases déjà cochées correspondent à un titre reconnu.
+                    </p>
+                    <table>
+                        <tr><th></th><th>Événement</th><th>Date</th><th>Durée</th><th>€</th></tr>
+                        {% for row in preview_data %}
+                        <tr>
+                            <td><input class="pick" type="checkbox" name="event_ids" value="{{ row.event_key }}" {% if row.pre_selected %}checked{% endif %}></td>
+                            <td>{{ row.nom }}{% if row.note %}<span class="row-note">{{ row.note }}</span>{% endif %}</td>
+                            <td>{{ row.date }}</td>
+                            <td>{{ row.duree }}h</td>
+                            <td>{{ row.montant }}</td>
+                        </tr>
+                        {% endfor %}
+                    </table>
+                    <div class="total">En attente : {{ total }} €</div>
+                </div>
+                <button type="submit" class="btn">Valider la sélection et Générer les factures</button>
             </form>
         {% else %}
             <div class="card" style="text-align: center; color: #8e8e93; font-size: 14px;">
-                Aucun cours n'est actuellement en attente de facturation.
+                Aucun événement n'est en attente de validation.
             </div>
         {% endif %}
         
@@ -647,6 +652,7 @@ def fetch_icloud_events():
         principal = client.principal()
         raw_lines = []
         agenda_events = []
+        already_invoiced = invoiced_keys()
         skipped = 0
         failed_calendars = 0
         seen_calendars = 0
@@ -668,13 +674,12 @@ def fetch_icloud_events():
                 try:
                     vevent = event.vobject_instance.vevent
                     summary = str(vevent.summary.value) if hasattr(vevent, "summary") else ""
-                    if "cours" not in summary.lower():
-                        continue
                     summary = summary.replace("|", " ").strip()
+                    if not summary:
+                        continue
                     dtstart = vevent.dtstart.value
                     dtend = vevent.dtend.value if hasattr(vevent, "dtend") else dtstart
-                    if not isinstance(dtstart, datetime) or not isinstance(dtend, datetime):
-                        skipped += 1
+                    if is_all_day(dtstart, dtend):
                         continue
                     instances = expand_occurrences(
                         dtstart,
@@ -690,7 +695,7 @@ def fetch_icloud_events():
                         status = event_status(start, end, now)
                         start_utc = as_utc(start)
                         end_utc = as_utc(end)
-                        if status == "terminé":
+                        if status == "terminé" and event_key(start, end, summary) not in already_invoiced:
                             raw_lines.append(f"{start_utc.isoformat()}|{end_utc.isoformat()}|{summary}")
                         agenda_events.append({
                             "iso_start": start_utc.isoformat(),
@@ -704,7 +709,7 @@ def fetch_icloud_events():
             return "Aucun calendrier n'a pu être lu. Les cours déjà enregistrés n'ont pas été modifiés."
         previous_raw = cache_text(RAW_EVENTS_KEY) or ""
         if should_keep_previous_events(len(agenda_events), previous_raw):
-            return "La synchro n'a renvoyé aucun cours. Les cours déjà enregistrés ont été conservés."
+            return "La synchro n'a renvoyé aucun événement. Les événements déjà enregistrés ont été conservés."
 
         save_sync(raw_lines, agenda_events)
         notes = []
@@ -740,7 +745,7 @@ def get_preview_data():
     total_global = 0.0
     raw_events = cache_text(RAW_EVENTS_KEY)
     if raw_events is None:
-        return [], "0.00", ["Aucun cours synchronisé."]
+        return [], "0.00", ["Aucun événement synchronisé."]
     lines = raw_events.strip().split("\n")
 
     for line in lines:
@@ -751,28 +756,31 @@ def get_preview_data():
         except ValueError as exc:
             warnings.append(str(exc))
             continue
-        if "cours" not in raw_name.lower():
-            continue
-        if event_key(start, end, raw_name) in invoiced:
-            continue
-        student_key, error = match_student(raw_name, student_db)
-        if error:
-            warnings.append(error)
-            continue
-        if "tarif" not in student_db[student_key]:
-            warnings.append(f"Tarif manquant pour {student_key}.")
+        key = event_key(start, end, raw_name)
+        if key in invoiced:
             continue
         duration = duration_hours(start, end)
         if duration <= 0:
             warnings.append(f"Durée invalide pour {raw_name}.")
             continue
-        montant = duration * float(student_db[student_key]["tarif"])
-        total_global += montant
+        student_key, error = match_student(raw_name, student_db)
+        billable = not error and "tarif" in student_db.get(student_key, {})
+        note = ""
+        if error:
+            note = error
+        elif not billable:
+            note = f"Tarif manquant pour {student_key}."
+        montant = duration * float(student_db[student_key]["tarif"]) if billable else None
+        if montant is not None:
+            total_global += montant
         preview_data.append({
+            "event_key": key,
+            "pre_selected": pre_selected(raw_name, student_db),
             "date": as_utc(start).astimezone(PARIS).strftime("%d/%m"),
-            "nom": student_key.title(),
+            "nom": student_key.title() if billable else raw_name,
             "duree": f"{duration:.2f}",
-            "montant": f"{montant:.2f}",
+            "montant": f"{montant:.2f}" if montant is not None else "—",
+            "note": note,
         })
     return preview_data, f"{total_global:.2f}", unique_notes(warnings)
 
@@ -1002,7 +1010,11 @@ def delete_file():
 
 @app.route("/generate", methods=["POST"])
 def generate():
-    result = pdf_generator.process_events()
+    selected = request.form.getlist("event_ids")
+    if not selected:
+        flash("Aucun événement sélectionné.", "warning")
+        return redirect("/")
+    result = pdf_generator.process_events(selected)
     if result["created"]:
         flash(f"{result['created']} facture(s) créée(s).", "success")
     else:

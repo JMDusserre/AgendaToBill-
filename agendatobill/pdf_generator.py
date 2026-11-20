@@ -312,13 +312,16 @@ def assign_invoice_numbers():
     db.session.expire_all()
 
 
-def process_events():
+def process_events(selected_keys):
     student_db = students_map()
     result = {"created": 0, "skipped": 0, "warnings": [], "files": []}
+    selected = {key for key in (selected_keys or []) if key}
 
     raw_events = cache_text(RAW_EVENTS_KEY)
     if raw_events is None:
-        result["warnings"].append("Aucun cours synchronisé.")
+        result["warnings"].append("Aucun événement synchronisé.")
+        return result
+    if not selected:
         return result
 
     lines = raw_events.strip().split("\n")
@@ -329,10 +332,9 @@ def process_events():
             continue
         try:
             start, end, raw_name = parse_event_line(line)
-            if "cours" not in raw_name.lower():
-                continue
-
             key = event_key(start, end, raw_name)
+            if key not in selected:
+                continue
             if key in invoiced:
                 result["skipped"] += 1
                 continue

@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 import zlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import agendatobill.pdf_generator as pdf_generator
@@ -14,9 +14,11 @@ from agendatobill.billing import (
     file_matches_person,
     fold_name,
     invoice_basename,
+    is_all_day,
     match_student,
     paris_date,
     parse_event_line,
+    pre_selected,
     should_keep_previous_events,
     starts_before_day,
 )
@@ -123,6 +125,21 @@ class BillingTests(unittest.TestCase):
         self.assertFalse(starts_before_day(november, limit))
         self.assertFalse(starts_before_day(october, None))
 
+    def test_pre_selected_uses_keywords_or_a_known_student(self):
+        students = {"camille martin": {"tarif": 40}}
+        self.assertTrue(pre_selected("Cours Camille Martin", students))
+        self.assertTrue(pre_selected("RDV inconnu", students))
+        self.assertTrue(pre_selected("Camille Martin", students))
+        self.assertFalse(pre_selected("Dentiste", students))
+        self.assertFalse(pre_selected("discours", students))
+
+    def test_all_day_events_are_dates_or_last_a_full_day(self):
+        from datetime import date
+        start = datetime(2026, 11, 6, 10, 0, tzinfo=timezone.utc)
+        self.assertTrue(is_all_day(date(2026, 11, 6), date(2026, 11, 7)))
+        self.assertTrue(is_all_day(start, start + timedelta(days=1)))
+        self.assertFalse(is_all_day(start, start + timedelta(hours=1)))
+
     def test_amount_is_read_from_a_compressed_pdf(self):
         stream = zlib.compress("Montant total à régler : 22.50 EUR".encode("latin-1"))
         pdf = b"stream\n" + stream + b"\nendstream"
@@ -148,9 +165,13 @@ class BillingTests(unittest.TestCase):
                 db.session.add(SyncCache(key="raw_events", data_text=events))
                 db.session.commit()
 
+                keys = [
+                    event_key(*parse_event_line(line))
+                    for line in events.splitlines()
+                ]
                 with mock.patch("builtins.print"):
-                    first = pdf_generator.process_events()
-                    second = pdf_generator.process_events()
+                    first = pdf_generator.process_events(keys)
+                    second = pdf_generator.process_events(keys)
 
                 self.assertEqual(first["created"], 2)
                 self.assertTrue(any("inconnu" in warning.lower() for warning in first["warnings"]))
@@ -190,7 +211,7 @@ class BillingTests(unittest.TestCase):
                 self.assertIsNone(db.session.get(InvoicedEvent, removed_key))
 
                 with mock.patch("builtins.print"):
-                    third = pdf_generator.process_events()
+                    third = pdf_generator.process_events(keys)
                 self.assertEqual(third["created"], 1)
                 self.assertEqual(third["skipped"], 1)
                 pdfs = InvoiceDocument.query.filter(InvoiceDocument.filename.endswith(".pdf")).all()
@@ -213,6 +234,22 @@ class BillingTests(unittest.TestCase):
                 self.assertEqual([row.invoice_number for row in numbered], [1, 2, 3])
                 self.assertIn("01-11-2026", numbered[0].filename)
                 self.assertTrue(numbered[0].filename.endswith("_n1.pdf"))
+
+                with mock.patch.object(webapp, "fetch_icloud_events", return_value=None):
+                    page = client.get("/")
+                self.assertEqual(page.status_code, 200)
+                self.assertIn(b"Valider la s\xc3\xa9lection et G\xc3\xa9n\xc3\xa9rer les factures", page.data)
+                self.assertIn(b'name="event_ids"', page.data)
+                self.assertIn(b"checked", page.data)
+                ignored = client.post("/generate", data={
+                    "csrf_token": "token-test",
+                    "event_ids": keys[2],
+                })
+                self.assertEqual(ignored.status_code, 302)
+                self.assertEqual(
+                    InvoiceDocument.query.filter(InvoiceDocument.filename.endswith(".pdf")).count(),
+                    3,
+                )
         finally:
             os.environ.pop("AGENDA_DATABASE_URL", None)
             os.remove(db_file.name)

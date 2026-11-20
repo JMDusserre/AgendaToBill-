@@ -1,0 +1,43 @@
+.
+├── __pycache__
+│   ├── app.cpython-314.pyc
+│   ├── billing.cpython-314.pyc
+│   ├── pdf_generator.cpython-314.pyc
+│   └── test_billing.cpython-314.pyc
+├── agendatobill
+│   ├── __init__.py
+│   ├── __pycache__
+│   │   ├── __init__.cpython-314.pyc
+│   │   ├── billing.cpython-314.pyc
+│   │   ├── models.cpython-314.pyc
+│   │   ├── paths.cpython-314.pyc
+│   │   └── pdf_generator.cpython-314.pyc
+│   ├── billing.py
+│   ├── models.py
+│   ├── paths.py
+│   └── pdf_generator.py
+├── app.py
+├── data
+│   ├── agenda.json
+│   ├── invoiced.json
+│   ├── ip.txt
+│   ├── raw_events.txt
+│   └── students.json
+├── factures
+│   ├── Facture_Laura_Clément_05-11-2026_1500-1600.pdf
+│   ├── Facture_Laura_Clément_06-11-2026_0838-0938.pdf
+│   ├── Facture_Martine_Dusserre_04-11-2026.pdf
+│   ├── Facture_Martine_Dusserre_05-11-2026_1100-1230.pdf
+│   └── recapitulatif_urssaf.txt
+├── README.md
+├── render.yaml
+├── requirements.txt
+├── scripts
+│   └── test_caldav.py
+├── tests
+│   ├── __pycache__
+│   │   └── test_billing.cpython-314.pyc
+│   └── test_billing.py
+└── tree.txt
+
+9 directories, 32 files
